@@ -1,5 +1,7 @@
 # YSP SFU - 选择性转发单元
 
+[English](README.en.md) | 中文
+
 基于 Go + pion/webrtc v3 实现的标准 SFU（Selective Forwarding Unit）。
 
 所有音视频媒体流量全部经过服务器转发，浏览器之间不建立任何直接 P2P 连接。
@@ -37,7 +39,8 @@ ysp/
 ├── console_other.go   # 非 Windows 平台：空实现，保证跨平台编译
 ├── index.html       # 前端测试页面（嵌入二进制）
 ├── go.mod
-└── README.md
+├── README.md        # 中文文档
+└── README.en.md     # 英文文档
 ```
 
 ## 编译
