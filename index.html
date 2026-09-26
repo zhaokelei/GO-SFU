@@ -1,0 +1,2429 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<meta name="theme-color" content="#0a0e1a">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<title>YSP 视频通话</title>
+<!--
+  服务端渲染页面时会把下面的占位符替换成内嵌 TURN 的 JSON 配置
+  （形如 {"urls":["turn:1.2.3.4:3478"],"username":"ysp","credential":"xxxx"}；
+   未启用内嵌 TURN 时替换为 null）。
+  这样 TURN 中继就完全集成在 exe 内，客户端打开页面即自动生效，无需手动配置。
+-->
+<script>
+window.__YSP_TURN__ = __YSP_TURN_CONFIG_PLACEHOLDER__;
+</script>
+<style>
+  /* ============================================================
+     设计变量
+     ============================================================ */
+  :root {
+    --bg: #0a0e1a;
+    --bg-grad-1: #0f172a;
+    --bg-grad-2: #0a0e1a;
+    --surface: rgba(30, 41, 59, 0.66);
+    --surface-solid: #161f33;
+    --surface-2: rgba(71, 85, 105, 0.28);
+    --surface-hover: rgba(71, 85, 105, 0.42);
+    --border: rgba(148, 163, 184, 0.14);
+    --border-strong: rgba(148, 163, 184, 0.28);
+    --text: #e8eefc;
+    --text-dim: #94a3b8;
+    --text-mute: #5b6b85;
+    --primary: #38bdf8;
+    --primary-soft: rgba(56, 189, 248, 0.14);
+    --success: #22c55e;
+    --success-soft: rgba(34, 197, 94, 0.16);
+    --danger: #ef4444;
+    --danger-soft: rgba(239, 68, 68, 0.16);
+    --warn: #f59e0b;
+    --radius: 16px;
+    --radius-md: 12px;
+    --radius-sm: 9px;
+    --shadow: 0 12px 44px rgba(0, 0, 0, 0.5);
+    --safe-b: env(safe-area-inset-bottom, 0px);
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; }
+
+  html, body { height: 100%; }
+
+  /* iOS Safari 的地址栏会让 100vh 偏大，优先使用动态视口单位 dvh */
+  @supports (height: 100dvh) {
+    html, body { height: 100dvh; }
+  }
+
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+                 "Hiragino Sans GB", "Microsoft YaHei", Roboto, sans-serif;
+    background: radial-gradient(1200px 800px at 15% -10%, #16233f 0%, var(--bg-grad-2) 55%) fixed,
+                var(--bg);
+    color: var(--text);
+    overflow: hidden;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  svg { display: block; width: 100%; height: 100%; }
+
+  /* 通用滚动条 */
+  ::-webkit-scrollbar { width: 6px; height: 6px; }
+  ::-webkit-scrollbar-thumb { background: rgba(148,163,184,0.24); border-radius: 3px; }
+  ::-webkit-scrollbar-thumb:hover { background: rgba(148,163,184,0.4); }
+  ::-webkit-scrollbar-track { background: transparent; }
+
+  /* ============================================================
+     视图容器
+     ============================================================ */
+  .view { display: none; height: 100%; }
+  .view.active { display: flex; }
+
+  /* ============================================================
+     登录页
+     ============================================================ */
+  #loginView {
+    align-items: center;
+    justify-content: center;
+    padding: 20px;
+    overflow-y: auto;
+  }
+
+  .login-card {
+    width: 100%;
+    max-width: 430px;
+    background: var(--surface);
+    backdrop-filter: blur(22px) saturate(160%);
+    -webkit-backdrop-filter: blur(22px) saturate(160%);
+    border: 1px solid var(--border);
+    border-radius: 22px;
+    padding: 30px 26px 26px;
+    box-shadow: var(--shadow);
+  }
+
+  .brand { display: flex; flex-direction: column; align-items: center; margin-bottom: 26px; }
+  .brand-logo {
+    width: 60px; height: 60px;
+    border-radius: 18px;
+    background: linear-gradient(135deg, var(--primary), #6366f1);
+    display: grid; place-items: center;
+    color: #fff;
+    box-shadow: 0 10px 30px rgba(56,189,248,0.32);
+    margin-bottom: 14px;
+  }
+  .brand-logo svg { width: 30px; height: 30px; }
+  .brand h1 { font-size: 20px; font-weight: 600; letter-spacing: 0.3px; }
+  .brand p { font-size: 13px; color: var(--text-mute); margin-top: 4px; }
+
+  .field { margin-bottom: 14px; }
+  .field label {
+    display: block;
+    font-size: 12px;
+    font-weight: 500;
+    color: var(--text-dim);
+    margin-bottom: 6px;
+    letter-spacing: 0.2px;
+  }
+
+  .control {
+    width: 100%;
+    height: 44px;
+    padding: 0 14px;
+    background: rgba(15, 23, 42, 0.7);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    color: var(--text);
+    font-size: 14px;
+    font-family: inherit;
+    transition: border-color .18s, background .18s;
+  }
+  .control:focus { outline: none; border-color: var(--primary); background: rgba(15,23,42,0.95); }
+  select.control { cursor: pointer; appearance: none; padding-right: 34px;
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='%2394a3b8'%3E%3Cpath d='M7 10l5 5 5-5z'/%3E%3C/svg%3E");
+    background-repeat: no-repeat; background-position: right 8px center; background-size: 20px;
+  }
+
+  .row-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+
+  /* ============================================================
+     按钮
+     ============================================================ */
+  .btn {
+    display: inline-flex; align-items: center; justify-content: center; gap: 8px;
+    height: 44px; padding: 0 18px;
+    border: none; border-radius: var(--radius-sm);
+    font-size: 14px; font-weight: 500; font-family: inherit;
+    cursor: pointer; transition: transform .14s, background .18s, opacity .18s;
+    white-space: nowrap;
+  }
+  .btn:active:not(:disabled) { transform: scale(0.975); }
+  .btn:disabled { opacity: 0.42; cursor: not-allowed; }
+  .btn svg { width: 18px; height: 18px; flex: none; }
+
+  .btn-primary { background: linear-gradient(135deg, var(--primary), #6366f1); color: #06121f; font-weight: 600; }
+  .btn-primary:hover:not(:disabled) { filter: brightness(1.08); }
+  .btn-ghost { background: var(--surface-2); color: var(--text); border: 1px solid var(--border); }
+  .btn-ghost:hover:not(:disabled) { background: var(--surface-hover); }
+  .btn-danger { background: var(--danger-soft); color: #fca5a5; border: 1px solid rgba(239,68,68,0.3); }
+  .btn-danger:hover:not(:disabled) { background: rgba(239,68,68,0.24); }
+  .btn-block { width: 100%; }
+
+  /* ============================================================
+     主界面布局（桌面：侧栏+内容；手机：单列）
+     ============================================================ */
+  #mainView { flex-direction: row; }
+
+  .sidebar {
+    width: 320px;
+    flex: none;
+    display: flex;
+    flex-direction: column;
+    background: var(--surface);
+    backdrop-filter: blur(20px) saturate(160%);
+    -webkit-backdrop-filter: blur(20px) saturate(160%);
+    border-right: 1px solid var(--border);
+    padding: 16px;
+    gap: 14px;
+  }
+
+  /* 我的信息 */
+  .me-card {
+    display: flex; align-items: center; gap: 12px;
+    padding: 12px;
+    background: var(--surface-2);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+  }
+  .avatar {
+    width: 42px; height: 42px; flex: none;
+    border-radius: 50%;
+    display: grid; place-items: center;
+    font-weight: 600; font-size: 16px; color: #06121f;
+    background: linear-gradient(135deg, var(--primary), #6366f1);
+  }
+  .me-info { flex: 1; min-width: 0; }
+  .me-name { font-size: 14px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .me-meta { font-size: 11px; color: var(--text-mute); margin-top: 2px; display: flex; gap: 8px; }
+  .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--text-mute); display: inline-block; }
+  .dot.on { background: var(--success); box-shadow: 0 0 8px rgba(34,197,94,0.7); }
+  .dot.off { background: var(--danger); }
+
+  /* 设备区 */
+  .panel {
+    background: var(--surface-2);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    padding: 12px;
+  }
+  .panel-title {
+    font-size: 12px; font-weight: 600; color: var(--text-dim);
+    display: flex; align-items: center; gap: 7px; margin-bottom: 10px;
+    letter-spacing: 0.3px;
+  }
+  .panel-title svg { width: 15px; height: 15px; color: var(--primary); }
+  .panel-title .count { margin-left: auto; font-size: 11px; color: var(--text-mute); font-weight: 400; }
+
+  /* 联系人列表 */
+  .contact-list { flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: 8px; min-height: 0; }
+
+  .contact {
+    display: flex; align-items: center; gap: 11px;
+    padding: 10px 11px;
+    background: var(--surface-2);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    transition: background .18s, border-color .18s;
+    animation: fadeUp .28s ease both;
+  }
+  .contact:hover { background: var(--surface-hover); border-color: var(--border-strong); }
+
+  @keyframes fadeUp {
+    from { opacity: 0; transform: translateY(6px); }
+    to { opacity: 1; transform: translateY(0); }
+  }
+
+  .contact .avatar { width: 38px; height: 38px; font-size: 14px; }
+  .contact-body { flex: 1; min-width: 0; }
+  .contact-name { font-size: 13.5px; font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .contact-status { font-size: 11px; color: var(--success); margin-top: 2px; }
+
+  .icon-btn {
+    width: 34px; height: 34px; flex: none;
+    display: grid; place-items: center;
+    border-radius: 50%; border: none; cursor: pointer;
+    transition: transform .14s, background .18s;
+  }
+  .icon-btn:active { transform: scale(0.92); }
+  .icon-btn svg { width: 17px; height: 17px; }
+  .icon-btn.video { background: var(--success-soft); color: #4ade80; }
+  .icon-btn.video:hover { background: rgba(34,197,94,0.28); }
+  .icon-btn.audio { background: var(--primary-soft); color: var(--primary); }
+  .icon-btn.audio:hover { background: rgba(56,189,248,0.26); }
+
+  .empty-tip {
+    flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center;
+    gap: 10px; color: var(--text-mute); font-size: 13px; text-align: center; padding: 24px 0;
+  }
+  .empty-tip svg { width: 34px; height: 34px; opacity: 0.4; }
+
+  /* ============================================================
+     内容区（桌面右侧）
+     ============================================================ */
+  .content {
+    flex: 1; min-width: 0;
+    display: flex; flex-direction: column;
+    padding: 16px; gap: 14px;
+    overflow-y: auto;
+  }
+
+  .stat-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(126px, 1fr)); gap: 10px; }
+  .stat-card {
+    background: var(--surface-2);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    padding: 12px 13px;
+  }
+  .stat-label { font-size: 11px; color: var(--text-mute); margin-bottom: 5px; }
+  .stat-value { font-size: 19px; font-weight: 600; color: var(--primary); font-variant-numeric: tabular-nums; }
+  .stat-value small { font-size: 11px; color: var(--text-mute); font-weight: 400; margin-left: 2px; }
+
+  /* 日志 */
+  .log-box {
+    flex: 1; min-height: 140px;
+    background: rgba(2, 6, 16, 0.62);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    padding: 11px 13px;
+    overflow-y: auto;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 11.5px;
+    line-height: 1.65;
+  }
+  .log-line { color: var(--text-dim); word-break: break-all; }
+  .log-info { color: #7dd3fc; }
+  .log-warn { color: #fbbf24; }
+  .log-error { color: #f87171; }
+  .log-success { color: #4ade80; }
+
+  /* ============================================================
+     通话界面（全屏）
+     ============================================================ */
+  .overlay {
+    position: fixed; inset: 0; z-index: 100;
+    display: none;
+    flex-direction: column;
+  }
+  .overlay.active { display: flex; }
+
+  #callView { background: #05070d; }
+
+  .remote-stage { position: absolute; inset: 0; background: #05070d; }
+  #remoteVideo { width: 100%; height: 100%; object-fit: cover; background: #05070d; }
+
+  /* 语音通话舞台 */
+  .audio-stage {
+    position: absolute; inset: 0;
+    display: none; flex-direction: column; align-items: center; justify-content: center;
+    background: radial-gradient(700px 520px at 50% 32%, #1b2b4d 0%, #070b16 72%);
+  }
+  .audio-stage.active { display: flex; }
+  .audio-avatar {
+    width: 132px; height: 132px;
+    border-radius: 50%;
+    display: grid; place-items: center;
+    font-size: 54px; font-weight: 600; color: #06121f;
+    background: linear-gradient(135deg, var(--primary), #6366f1);
+    position: relative;
+    margin-bottom: 26px;
+  }
+  .audio-avatar::before,
+  .audio-avatar::after {
+    content: ''; position: absolute; inset: -8px; border-radius: 50%;
+    border: 2px solid rgba(56,189,248,0.42);
+    animation: ripple 2.6s ease-out infinite;
+  }
+  .audio-avatar::after { animation-delay: 1.3s; }
+  @keyframes ripple {
+    0% { transform: scale(0.94); opacity: 0.85; }
+    100% { transform: scale(1.5); opacity: 0; }
+  }
+  .audio-name { font-size: 24px; font-weight: 600; margin-bottom: 8px; }
+  .audio-desc { font-size: 14px; color: var(--text-dim); letter-spacing: 0.4px; }
+
+  /* 通话顶部信息 */
+  .call-topbar {
+    position: relative; z-index: 3;
+    display: flex; align-items: center; gap: 10px;
+    padding: 14px 16px;
+    padding-top: calc(14px + env(safe-area-inset-top, 0px));
+    background: linear-gradient(to bottom, rgba(5,7,13,0.82), transparent);
+  }
+  .call-peer { display: flex; align-items: center; gap: 10px; min-width: 0; }
+  .call-peer .avatar { width: 36px; height: 36px; font-size: 14px; }
+  .call-peer-name { font-size: 15px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .call-peer-sub { font-size: 11.5px; color: var(--text-dim); margin-top: 1px; font-variant-numeric: tabular-nums; }
+
+  .quality {
+    margin-left: auto; flex: none;
+    display: flex; align-items: center; gap: 6px;
+    font-size: 11.5px; color: var(--text-dim);
+    background: rgba(5,7,13,0.55);
+    border: 1px solid var(--border);
+    border-radius: 20px;
+    padding: 5px 11px;
+    backdrop-filter: blur(10px);
+  }
+  .quality .dot { width: 7px; height: 7px; }
+
+  /* 本地画中画 */
+  .pip {
+    position: absolute; z-index: 4;
+    right: 16px; top: 76px;
+    width: 132px; height: 186px;
+    border-radius: var(--radius-md);
+    overflow: hidden;
+    background: #0d1424;
+    border: 1px solid rgba(148,163,184,0.26);
+    box-shadow: 0 10px 30px rgba(0,0,0,0.55);
+    cursor: pointer;
+    transition: transform .2s, right .2s, top .2s, width .2s, height .2s;
+  }
+  .pip:active { transform: scale(0.97); }
+  #localVideo { width: 100%; height: 100%; object-fit: cover; }
+  .pip-off {
+    position: absolute; inset: 0;
+    display: none; place-items: center;
+    background: rgba(13,20,36,0.94);
+    color: var(--text-mute);
+  }
+  .pip-off svg { width: 26px; height: 26px; }
+  .pip.off .pip-off { display: grid; }
+  .pip-tag {
+    position: absolute; left: 7px; bottom: 7px;
+    font-size: 10.5px; color: var(--text-dim);
+    background: rgba(5,7,13,0.7);
+    padding: 2px 7px; border-radius: 6px;
+  }
+
+  /* 通话控制栏 */
+  .call-bar {
+    position: relative; z-index: 5;
+    margin-top: auto;
+    display: flex; align-items: center; justify-content: center; gap: 14px;
+    padding: 18px 16px calc(18px + var(--safe-b));
+    background: linear-gradient(to top, rgba(5,7,13,0.9), transparent);
+  }
+  .ctrl {
+    width: 54px; height: 54px;
+    display: grid; place-items: center;
+    border: none; border-radius: 50%;
+    background: rgba(51,65,85,0.66);
+    color: var(--text);
+    cursor: pointer;
+    backdrop-filter: blur(12px);
+    transition: transform .14s, background .18s, color .18s;
+  }
+  .ctrl svg { width: 23px; height: 23px; }
+  .ctrl:active { transform: scale(0.92); }
+  .ctrl.off { background: rgba(239,68,68,0.88); color: #fff; }
+  .ctrl.hangup { background: var(--danger); color: #fff; width: 62px; height: 62px; }
+  .ctrl.hangup svg { width: 27px; height: 27px; }
+  .ctrl.hidden { display: none; }
+
+  /* ============================================================
+     来电界面
+     ============================================================ */
+  #incomingView {
+    z-index: 200;
+    align-items: center; justify-content: center;
+    background: rgba(5, 8, 16, 0.92);
+    backdrop-filter: blur(18px);
+    -webkit-backdrop-filter: blur(18px);
+  }
+  .incoming-box { display: flex; flex-direction: column; align-items: center; padding: 24px; }
+  .incoming-avatar {
+    width: 112px; height: 112px;
+    border-radius: 50%;
+    display: grid; place-items: center;
+    font-size: 46px; font-weight: 600; color: #06121f;
+    background: linear-gradient(135deg, var(--primary), #6366f1);
+    margin-bottom: 22px;
+    position: relative;
+  }
+  .incoming-avatar::before {
+    content: ''; position: absolute; inset: -10px; border-radius: 50%;
+    border: 2px solid rgba(56,189,248,0.45);
+    animation: ripple 1.8s ease-out infinite;
+  }
+  .incoming-name { font-size: 23px; font-weight: 600; margin-bottom: 7px; }
+  .incoming-type { font-size: 14px; color: var(--text-dim); margin-bottom: 46px; }
+  .incoming-actions { display: flex; gap: 56px; }
+  .incoming-actions .ctrl { width: 64px; height: 64px; }
+  .incoming-actions .ctrl svg { width: 27px; height: 27px; }
+  .incoming-actions .ctrl.reject { background: var(--danger); color: #fff; }
+  .incoming-actions .ctrl.accept { background: var(--success); color: #fff; }
+  .incoming-actions .ctrl-label {
+    display: block; text-align: center; margin-top: 9px;
+    font-size: 12px; color: var(--text-mute);
+  }
+  .incoming-action-wrap { display: flex; flex-direction: column; align-items: center; }
+
+  /* ============================================================
+     设备底部面板
+     ============================================================ */
+  .sheet-mask {
+    position: fixed; inset: 0; z-index: 300;
+    background: rgba(2,5,12,0.6);
+    backdrop-filter: blur(3px);
+    display: none;
+  }
+  .sheet-mask.active { display: block; }
+  .sheet {
+    position: fixed; left: 0; right: 0; bottom: 0; z-index: 301;
+    max-width: 520px; margin: 0 auto;
+    background: var(--surface-solid);
+    border: 1px solid var(--border);
+    border-bottom: none;
+    border-radius: 20px 20px 0 0;
+    padding: 20px 20px calc(20px + var(--safe-b));
+    box-shadow: 0 -14px 44px rgba(0,0,0,0.6);
+    transform: translateY(102%);
+    transition: transform .3s cubic-bezier(.32,.72,0,1);
+  }
+  .sheet.active { transform: translateY(0); }
+  .sheet-handle { width: 38px; height: 4px; border-radius: 2px; background: rgba(148,163,184,0.32); margin: 0 auto 16px; }
+  .sheet-title { font-size: 15px; font-weight: 600; margin-bottom: 16px; }
+
+  /* Toast */
+  .toast {
+    position: fixed; left: 50%; top: 22px; z-index: 400;
+    transform: translate(-50%, -18px);
+    background: rgba(22,32,52,0.96);
+    border: 1px solid var(--border-strong);
+    color: var(--text);
+    font-size: 13px;
+    padding: 10px 18px;
+    border-radius: 30px;
+    box-shadow: var(--shadow);
+    opacity: 0; pointer-events: none;
+    transition: opacity .24s, transform .24s;
+    max-width: 88vw; text-align: center;
+  }
+  .toast.show { opacity: 1; transform: translate(-50%, 0); }
+
+  /* 自动播放被阻止时的提示（iOS 需要用户手势） */
+  .tap-hint {
+    position: fixed; left: 50%; bottom: 112px; z-index: 250;
+    transform: translateX(-50%);
+    background: rgba(245, 158, 11, 0.95);
+    color: #1a1206;
+    font-size: 13px; font-weight: 600;
+    padding: 10px 20px; border-radius: 30px;
+    box-shadow: 0 8px 26px rgba(0,0,0,0.45);
+    display: none;
+    white-space: nowrap;
+  }
+  .tap-hint.show { display: block; animation: fadeUp .28s ease both; }
+
+  /* ============================================================
+     响应式：手机端
+     ============================================================ */
+  @media (max-width: 860px) {
+    #mainView { flex-direction: column; }
+    .sidebar {
+      width: 100%; flex: none; max-height: 52vh;
+      border-right: none; border-bottom: 1px solid var(--border);
+      padding: 12px;
+    }
+    .content { padding: 12px; }
+    .contact-list { max-height: 30vh; }
+    .stat-grid { grid-template-columns: repeat(2, 1fr); }
+    .pip { width: 104px; height: 148px; right: 12px; top: 68px; }
+    .call-bar { gap: 10px; padding: 14px 12px calc(14px + var(--safe-b)); }
+    .ctrl { width: 48px; height: 48px; }
+    .ctrl svg { width: 21px; height: 21px; }
+    .ctrl.hangup { width: 56px; height: 56px; }
+    .ctrl.hangup svg { width: 24px; height: 24px; }
+  }
+
+  @media (max-width: 380px) {
+    .call-bar { gap: 8px; }
+    .ctrl { width: 44px; height: 44px; }
+    .ctrl svg { width: 19px; height: 19px; }
+    .ctrl.hangup { width: 52px; height: 52px; }
+  }
+</style>
+</head>
+<body>
+
+<!-- ============================================================
+     登录页
+     ============================================================ -->
+<div class="view active" id="loginView">
+  <div class="login-card">
+    <div class="brand">
+      <div class="brand-logo" data-icon="videocam"></div>
+      <h1>YSP 视频通话</h1>
+      <p>基于 SFU 的多方音视频通话</p>
+    </div>
+
+    <div class="field">
+      <label>服务器地址</label>
+      <input class="control" type="text" id="serverAddr" placeholder="192.168.1.100:2033">
+    </div>
+    <div class="row-2">
+      <div class="field">
+        <label>房间 ID</label>
+        <input class="control" type="text" id="roomId" value="room1">
+      </div>
+      <div class="field">
+        <label>我的名称</label>
+        <input class="control" type="text" id="sessionId" placeholder="请输入昵称">
+      </div>
+    </div>
+    <div class="field">
+      <label>摄像头</label>
+      <select class="control" id="cameraSelect"></select>
+    </div>
+    <div class="field">
+      <label>麦克风</label>
+      <select class="control" id="micSelect"></select>
+    </div>
+
+    <div class="row-2" style="margin-top:18px; gap:10px;">
+      <button class="btn btn-ghost" id="refreshDevicesBtn">
+        <span data-icon="refresh" style="width:17px;height:17px;"></span>刷新设备
+      </button>
+      <button class="btn btn-primary" id="connectBtn">
+        <span data-icon="login" style="width:17px;height:17px;"></span>连接
+      </button>
+    </div>
+  </div>
+</div>
+
+<!-- ============================================================
+     主界面
+     ============================================================ -->
+<div class="view" id="mainView">
+  <aside class="sidebar">
+    <!-- 我的信息 -->
+    <div class="me-card">
+      <div class="avatar" id="meAvatar">?</div>
+      <div class="me-info">
+        <div class="me-name" id="meName">未连接</div>
+        <div class="me-meta">
+          <span><span class="dot" id="wsDot"></span> 信令</span>
+          <span><span class="dot" id="iceDot"></span> 媒体</span>
+        </div>
+      </div>
+      <button class="icon-btn audio" id="disconnectBtn" title="退出房间" data-icon="logout"></button>
+    </div>
+
+    <!-- 设备 -->
+    <div class="panel">
+      <div class="panel-title"><span data-icon="settings"></span>设备</div>
+      <div class="field" style="margin-bottom:10px;">
+        <select class="control" id="cameraSelectMain"></select>
+      </div>
+      <div class="field" style="margin-bottom:0;">
+        <select class="control" id="micSelectMain"></select>
+      </div>
+    </div>
+
+    <!-- 在线联系人 -->
+    <div class="panel-title" style="padding-left:2px;">
+      <span data-icon="users"></span>在线联系人
+      <span class="count" id="contactCount">0 人</span>
+    </div>
+    <div class="contact-list" id="contactList"></div>
+  </aside>
+
+  <main class="content">
+    <div class="panel-title"><span data-icon="chart"></span>实时状态</div>
+    <div class="stat-grid">
+      <div class="stat-card">
+        <div class="stat-label">接收包数</div>
+        <div class="stat-value" id="statRecv">0</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">丢包数</div>
+        <div class="stat-value" id="statLost">0</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">丢包率</div>
+        <div class="stat-value" id="statLoss">0<small>%</small></div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">往返延迟</div>
+        <div class="stat-value" id="statRtt">0<small>ms</small></div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">接收码率</div>
+        <div class="stat-value" id="statBitrate">0<small>kbps</small></div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">上传码率</div>
+        <div class="stat-value" id="statUpBitrate">0<small>kbps</small></div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">抖动</div>
+        <div class="stat-value" id="statJitter">0<small>ms</small></div>
+      </div>
+      <!-- 当前速率：接收 + 上传的实时合计带宽 -->
+      <div class="stat-card">
+        <div class="stat-label">当前速率</div>
+        <div class="stat-value" id="statRate">0<small>kbps</small></div>
+      </div>
+      <!-- 连接方式：直连（内网/打洞）还是走内嵌 TURN 中继 -->
+      <div class="stat-card">
+        <div class="stat-label">连接方式</div>
+        <div class="stat-value" id="statConnType">未知</div>
+      </div>
+    </div>
+
+    <div class="panel-title" style="padding-left:2px; margin-top:4px;">
+      <span data-icon="terminal"></span>运行日志
+    </div>
+    <div class="log-box" id="logBox"></div>
+  </main>
+</div>
+
+<!-- ============================================================
+     通话界面
+     ============================================================ -->
+<div class="overlay" id="callView">
+  <div class="remote-stage">
+    <video id="remoteVideo" autoplay playsinline muted></video>
+    <audio id="remoteAudio" autoplay playsinline></audio>
+    <div class="audio-stage" id="audioStage">
+      <div class="audio-avatar" id="audioAvatar">?</div>
+      <div class="audio-name" id="audioName">对方</div>
+      <div class="audio-desc" id="audioDesc">语音通话中</div>
+    </div>
+  </div>
+
+  <div class="call-topbar">
+    <div class="call-peer">
+      <div class="avatar" id="callPeerAvatar">?</div>
+      <div>
+        <div class="call-peer-name" id="callPeerName">对方</div>
+        <div class="call-peer-sub" id="callTimer">00:00</div>
+      </div>
+    </div>
+    <div class="quality">
+      <span class="dot on" id="qualityDot"></span>
+      <span id="qualityText">良好</span>
+    </div>
+    <!-- 实时速率 + 当前连接方式（通话全屏时主面板被遮住，这里再显示一份） -->
+    <div class="quality" style="margin-left:0;">
+      <span id="callRate">0 kbps</span>
+      <span style="opacity:.35;">·</span>
+      <span id="callConnType">未知</span>
+    </div>
+  </div>
+
+  <div class="pip" id="pip">
+    <video id="localVideo" autoplay muted playsinline></video>
+    <div class="pip-off" data-icon="videocam-off"></div>
+    <div class="pip-tag">我</div>
+  </div>
+
+  <div class="call-bar">
+    <button class="ctrl" id="muteBtn" title="麦克风" data-icon="mic"></button>
+    <button class="ctrl" id="cameraBtn" title="摄像头" data-icon="videocam"></button>
+    <button class="ctrl hidden" id="flipBtn" title="翻转摄像头" data-icon="flip"></button>
+    <button class="ctrl" id="speakerBtn" title="扬声器/听筒" data-icon="speaker"></button>
+    <button class="ctrl" id="deviceBtn" title="切换设备" data-icon="settings"></button>
+    <button class="ctrl hangup" id="hangupBtn" title="挂断" data-icon="hangup"></button>
+  </div>
+</div>
+
+<!-- ============================================================
+     来电界面
+     ============================================================ -->
+<div class="overlay" id="incomingView">
+  <div class="incoming-box">
+    <div class="incoming-avatar" id="incomingAvatar">?</div>
+    <div class="incoming-name" id="incomingName">来电</div>
+    <div class="incoming-type" id="incomingType">视频通话</div>
+    <div class="incoming-actions">
+      <div class="incoming-action-wrap">
+        <button class="ctrl reject" id="rejectBtn" data-icon="hangup"></button>
+        <span class="ctrl-label">拒绝</span>
+      </div>
+      <div class="incoming-action-wrap">
+        <button class="ctrl accept" id="acceptBtn" data-icon="phone"></button>
+        <span class="ctrl-label">接听</span>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ============================================================
+     设备面板
+     ============================================================ -->
+<div class="sheet-mask" id="sheetMask"></div>
+<div class="sheet" id="deviceSheet">
+  <div class="sheet-handle"></div>
+  <div class="sheet-title">切换设备</div>
+  <div class="field">
+    <label>摄像头</label>
+    <select class="control" id="cameraSelectCall"></select>
+  </div>
+  <div class="field" style="margin-bottom:16px;">
+    <label>麦克风</label>
+    <select class="control" id="micSelectCall"></select>
+  </div>
+  <button class="btn btn-primary btn-block" id="closeDeviceSheet">完成</button>
+</div>
+
+<div class="toast" id="toast"></div>
+<div class="tap-hint" id="tapHint">轻触屏幕恢复声音</div>
+
+<script>
+// ============================================================
+// SVG 图标（Material 风格）
+// ============================================================
+const ICONS = {
+  videocam: '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M17 10.5V7a1 1 0 0 0-1-1H4a1 1 0 0 0-1 1v10a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-3.5l4 4v-11l-4 4z"/></svg>',
+  'videocam-off': '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M21 6.5l-4 4V7a1 1 0 0 0-1-1H9.82L21 17.18V6.5zM3.27 2L2 3.27 4.73 6H4a1 1 0 0 0-1 1v10a1 1 0 0 0 1 1h12c.21 0 .39-.08.54-.18L19.73 21 21 19.73 3.27 2z"/></svg>',
+  phone: '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M6.62 10.79c1.44 2.83 3.76 5.14 6.59 6.59l2.2-2.2a1 1 0 0 1 1.02-.24c1.12.37 2.33.57 3.57.57a1 1 0 0 1 1 1V20a1 1 0 0 1-1 1C10.61 21 3 13.39 3 4a1 1 0 0 1 1-1h3.5a1 1 0 0 1 1 1c0 1.25.2 2.45.57 3.57a1 1 0 0 1-.25 1.02l-2.2 2.2z"/></svg>',
+  hangup: '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 9c-1.6 0-3.15.25-4.6.72v3.1c0 .39-.23.74-.56.9-.98.49-1.87 1.12-2.66 1.85a1 1 0 0 1-.7.28c-.28 0-.53-.11-.71-.29L.29 13.08a.99.99 0 0 1-.29-.7c0-.28.11-.53.29-.71C3.34 8.78 7.46 7 12 7s8.66 1.78 11.71 4.67c.18.18.29.43.29.71 0 .28-.11.53-.29.71l-2.48 2.48a.99.99 0 0 1-.71.29c-.27 0-.52-.11-.7-.28-.79-.74-1.69-1.36-2.67-1.85-.33-.16-.56-.5-.56-.9v-3.1C15.15 9.25 13.6 9 12 9z"/></svg>',
+  mic: '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 14a3 3 0 0 0 3-3V5a3 3 0 0 0-6 0v6a3 3 0 0 0 3 3z"/><path d="M17 11a5 5 0 0 1-10 0H5a7 7 0 0 0 6 6.92V21h2v-3.08A7 7 0 0 0 19 11h-2z"/></svg>',
+  'mic-off': '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M19 11h-1.7c0 .74-.16 1.43-.43 2.05l1.23 1.23c.56-.98.9-2.09.9-3.28zm-4.02.17c0-.06.02-.11.02-.17V5a3 3 0 0 0-6 0v.18l5.98 5.99zM4.27 3L3 4.27l6.01 6.01V11a3 3 0 0 0 2.99 3c.22 0 .44-.03.65-.08l1.66 1.66c-.71.33-1.5.52-2.31.52a5.01 5.01 0 0 1-4.99-5.1H5c0 3.41 2.72 6.23 6 6.72V21h2v-3.28c.91-.13 1.77-.45 2.54-.9L19.73 21 21 19.73 4.27 3z"/></svg>',
+  flip: '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M20 5h-3.17L15 3H9L7.17 5H4a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V7a2 2 0 0 0-2-2zm-5 11.5V13H9v3.5L5.5 13 9 9.5V13h6V9.5l3.5 3.5-3.5 3.5z"/></svg>',
+  settings: '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M19.14 12.94a7.07 7.07 0 0 0 0-1.88l2.03-1.58a.5.5 0 0 0 .12-.61l-1.92-3.32a.5.5 0 0 0-.59-.22l-2.39.96a7.03 7.03 0 0 0-1.62-.94l-.36-2.54a.5.5 0 0 0-.48-.41h-3.84a.5.5 0 0 0-.47.41l-.36 2.54c-.59.24-1.13.57-1.62.94l-2.39-.96a.5.5 0 0 0-.59.22L2.74 8.87a.5.5 0 0 0 .12.61l2.03 1.58a7.07 7.07 0 0 0 0 1.88l-2.03 1.58a.5.5 0 0 0-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32a.5.5 0 0 0-.12-.61l-2.01-1.58zM12 15.6A3.6 3.6 0 1 1 12 8.4a3.6 3.6 0 0 1 0 7.2z"/></svg>',
+  users: '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M16 11a3 3 0 1 0 0-6 3 3 0 0 0 0 6zm-8 0a3 3 0 1 0 0-6 3 3 0 0 0 0 6zm0 2c-2.33 0-7 1.17-7 3.5V19h14v-2.5c0-2.33-4.67-3.5-7-3.5zm8 0c-.29 0-.62.02-.97.05 1.16.84 1.97 1.97 1.97 3.45V19h6v-2.5c0-2.33-4.67-3.5-7-3.5z"/></svg>',
+  chart: '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M5 9.2h3V19H5zM10.6 5h2.8v14h-2.8zm5.6 8H19v6h-2.8z"/></svg>',
+  terminal: '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M20 4H4a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V6a2 2 0 0 0-2-2zm-9 11H9v-2h2v2zm0-4H9V9h2v2zm4 4h-2v-2h2v2zm0-4h-2V9h2v2z"/></svg>',
+  logout: '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M17 7l-1.41 1.41L18.17 11H8v2h10.17l-2.58 2.58L17 17l5-5zM4 5h8V3H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h8v-2H4V5z"/></svg>',
+  login: '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M10 17l1.41-1.41L8.83 13H20v-2H8.83l2.58-2.59L10 7l-5 5zM4 3h8V1H4a2 2 0 0 0-2 2v18a2 2 0 0 0 2 2h8v-2H4V3z"/></svg>',
+  refresh: '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M17.65 6.35A8 8 0 1 0 19.73 14h-2.08A6 6 0 1 1 12 6c1.66 0 3.14.69 4.22 1.78L13 11h7V4l-2.35 2.35z"/></svg>',
+  speaker: '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M3 9v6h4l5 5V4L7 9H3zm13.5 3a4.5 4.5 0 0 0-2.5-4.03v8.05A4.5 4.5 0 0 0 16.5 12zM14 3.23v2.06c2.89.86 5 3.54 5 6.71s-2.11 5.85-5 6.71v2.06c4.01-.91 7-4.49 7-8.77s-2.99-7.86-7-8.77z"/></svg>',
+  'speaker-off': '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M16.5 12A4.5 4.5 0 0 0 14 7.97v2.21l2.45 2.45c.03-.2.05-.41.05-.63zm2.5 0c0 .94-.2 1.82-.54 2.64l1.51 1.51A8.94 8.94 0 0 0 21 12c0-4.28-2.99-7.86-7-8.77v2.06c2.89.86 5 3.54 5 6.71zM4.27 3L3 4.27 7.73 9H3v6h4l5 5v-6.73l4.25 4.25c-.67.52-1.42.93-2.25 1.18v2.06a8.99 8.99 0 0 0 3.69-1.81L19.73 21 21 19.73l-9-9L4.27 3zM12 4L9.91 6.09 12 8.18V4z"/></svg>'
+};
+
+// 填充所有 data-icon 元素
+document.querySelectorAll('[data-icon]').forEach(el => {
+  const key = el.dataset.icon;
+  if (ICONS[key]) el.innerHTML = ICONS[key];
+});
+
+// 根据名字切换按钮图标
+function setBtnIcon(el, key) {
+  if (el && ICONS[key]) el.innerHTML = ICONS[key];
+}
+
+// ============================================================
+// 全局状态
+// ============================================================
+let ws = null;
+let pc = null;
+let localStream = null;
+let roomId = '';
+let sessionId = '';   // 唯一连接 ID（本机持久化，用于信令寻址；允许同名昵称并存）
+let userName = '';    // 显示昵称（允许重复，仅用于界面展示）
+let serverAddr = '';
+let reconnectTimer = null;
+let reconnectAttempts = 0;
+const MAX_RECONNECT = 10;
+
+// 通话状态
+let callState = 'idle';   // idle | calling | incoming | connected
+let callPeer = '';
+let callType = '';        // video | audio
+let callStartTs = 0;
+let callTimerInt = null;
+let isMuted = false;
+let isCameraOn = true;
+let usingFakeMedia = false;
+let fakeTimer = null;
+let autoPlayBlocked = false; // iOS 自动播放被阻止时置位，等待用户手势恢复
+
+// 协商状态（避免 glare 冲突的关键）
+let makingOffer = false;
+let pendingSubscribes = [];
+// 已订阅的轨道集合（publisherId:trackId），避免同一路轨道被重复订阅，
+// 否则远端会重复收到同一音轨并叠加播放，明显加重回声/啸叫
+let subscribedKeys = new Set();
+// 因协商冲突（glare）回滚本地 Offer 后，需要重新发起一次 Offer 以完成发布协商
+let needReoffer = false;
+// makeOffer 在本地正忙时不再直接丢弃，而是"排队"，等信令回到 stable 后
+// 由 signalingstatechange 自动补发。与 glare 的 needReoffer 相互独立，避免竞态。
+let pendingReoffer = false;
+let pendingReofferIceRestart = false;
+
+// ICE 主动恢复状态
+// disconnected / failed 时若不做任何处理，双方会一直停在断开状态，
+// 直到服务端 iceDisconnectGrace(15s) 宽限期超时后关闭会话，通话就断了。
+// 这里记录重启尝试次数与定时器，用于带退避地自动重启 ICE 并重协商。
+let iceRestartAttempts = 0;
+let iceRestartTimer = null;
+const ICE_RESTART_MAX_ATTEMPTS = 4; // 单次断线内最多尝试 4 次
+
+// 在线用户：sessionId(唯一连接 ID) -> name(显示昵称)
+const onlineUsers = new Map();
+
+// 设备
+let camDevices = [];
+let micDevices = [];
+let selectedCamId = '';
+let selectedMicId = '';
+let camInitialized = false;
+const CAM_FRONT = '__front__';
+const CAM_BACK = '__back__';
+
+// ============================================================
+// 工具函数
+// ============================================================
+function $(id) { return document.getElementById(id); }
+
+function logMsg(msg, type = 'info') {
+  const box = $('logBox');
+  if (!box) return;
+  const t = new Date().toLocaleTimeString('zh-CN', { hour12: false });
+  const div = document.createElement('div');
+  div.className = 'log-line log-' + type;
+  div.textContent = `[${t}] ${msg}`;
+  box.appendChild(div);
+  box.scrollTop = box.scrollHeight;
+  while (box.children.length > 300) box.removeChild(box.firstChild);
+}
+
+let toastTimer = null;
+function toast(msg) {
+  const el = $('toast');
+  el.textContent = msg;
+  el.classList.add('show');
+  if (toastTimer) clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => el.classList.remove('show'), 2400);
+}
+
+function fmtTime(sec) {
+  const m = String(Math.floor(sec / 60)).padStart(2, '0');
+  const s = String(sec % 60).padStart(2, '0');
+  return `${m}:${s}`;
+}
+
+function setDot(id, state) {
+  const el = $(id);
+  if (!el) return;
+  el.className = 'dot ' + state;
+}
+
+// ============================================================
+// WebSocket 信令
+// ============================================================
+// getClientId 读取/生成本标签页唯一的连接 ID
+// 该 ID 与显示昵称解耦：昵称可重复，连接 ID 必须唯一；
+// 否则两个同名客户端会互相顶替，导致每秒断连重连
+// 使用 sessionStorage：同一标签页刷新/断线重连保持同一 ID，
+// 而同一浏览器的多个标签页各自独立，避免互踢
+function getClientId() {
+  let id = '';
+  try { id = sessionStorage.getItem('ysp_client_id') || ''; } catch (e) {}
+  if (!id) {
+    id = 'c_' + Date.now().toString(36) + Math.random().toString(36).substring(2, 8);
+    try { sessionStorage.setItem('ysp_client_id', id); } catch (e) {}
+  }
+  return id;
+}
+
+// peerName 由唯一连接 ID 取显示昵称（取不到时回退为 ID 本身）
+function peerName(id) { return onlineUsers.get(id) || id; }
+
+function connect() {
+  serverAddr = $('serverAddr').value.trim();
+  roomId = $('roomId').value.trim();
+  userName = $('sessionId').value.trim();
+  if (!serverAddr || !roomId || !userName) {
+    toast('请填写服务器地址、房间 ID 和昵称');
+    return;
+  }
+  // 连接 ID 使用本机持久化的唯一值，与昵称完全分离
+  sessionId = getClientId();
+
+  $('meName').textContent = userName;
+  $('meAvatar').textContent = userName.charAt(0).toUpperCase();
+
+  // 页面通过 HTTPS 打开时必须使用 wss，否则浏览器会拦截混合内容
+  const wsProto = location.protocol === 'https:' ? 'wss' : 'ws';
+  const wsUrl = `${wsProto}://${serverAddr}/ws`;
+  logMsg('正在连接 ' + wsUrl);
+  setDot('wsDot', 'off');
+
+  try {
+    ws = new WebSocket(wsUrl);
+  } catch (e) {
+    logMsg('连接失败: ' + e.message, 'error');
+    scheduleReconnect();
+    return;
+  }
+
+  ws.onopen = () => {
+    logMsg('信令已连接', 'success');
+    setDot('wsDot', 'on');
+    reconnectAttempts = 0;
+    sendMsg({ type: 'join', data: { roomId, sessionId, name: userName } });
+  };
+
+  ws.onmessage = (e) => {
+    try { handleServerMsg(JSON.parse(e.data)); }
+    catch (err) { logMsg('消息解析失败: ' + err.message, 'warn'); }
+  };
+
+  ws.onclose = () => {
+    logMsg('信令连接断开', 'warn');
+    setDot('wsDot', 'off');
+    setDot('iceDot', 'off');
+    cleanupPC();
+    scheduleReconnect();
+  };
+
+  ws.onerror = () => logMsg('信令连接出错', 'error');
+}
+
+function disconnect() {
+  reconnectAttempts = MAX_RECONNECT;
+  if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+  if (ws) { try { ws.close(); } catch (e) {} ws = null; }
+  cleanupPC();
+  onlineUsers.clear();
+  renderContacts();
+  $('mainView').classList.remove('active');
+  $('loginView').classList.add('active');
+  logMsg('已退出房间', 'warn');
+}
+
+function scheduleReconnect() {
+  if ($('loginView').classList.contains('active')) return;
+  if (reconnectAttempts >= MAX_RECONNECT) {
+    logMsg('已达最大重连次数，停止重连', 'error');
+    return;
+  }
+  reconnectAttempts++;
+  const delay = Math.min(1000 * Math.pow(1.5, reconnectAttempts - 1), 10000);
+  logMsg(`将在 ${Math.round(delay / 1000)} 秒后重连（第 ${reconnectAttempts} 次）`, 'warn');
+  if (reconnectTimer) clearTimeout(reconnectTimer);
+  reconnectTimer = setTimeout(() => {
+    if (ws && ws.readyState === WebSocket.OPEN) return;
+    connect();
+  }, delay);
+}
+
+function sendMsg(msg) {
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify(msg));
+    return true;
+  }
+  return false;
+}
+
+// ============================================================
+// 协商状态管理（避免双方同时发 offer 造成 DTLS 角色冲突）
+// ============================================================
+function reportNegotiationState(busy) {
+  sendMsg({ type: 'negotiation_state', data: { busy: !!busy } });
+}
+
+function isNegotiating() {
+  return makingOffer || (pc && pc.signalingState !== 'stable');
+}
+
+// makeOffer 统一发起协商入口（串行化，避免本地并发协商）
+// iceRestart 为 true 时生成"ICE 重启"Offer（携带新的 ICE 用户名/密码），
+// 用于在连通性检查失败后重新收集候选、重新打洞，恢复既有通话。
+async function makeOffer(iceRestart) {
+  if (!pc) return;
+  if (pc.signalingState !== 'stable') {
+    // 本地正在协商：不直接丢弃，改为排队，等信令回到 stable 后自动补发。
+    // 否则在"挂断后立刻再次接听"等状态未复位的场景下，会永久发不出 Offer，
+    // 导致本端轨道不上报、对端一直收不到画面。
+    pendingReoffer = true;
+    if (iceRestart) pendingReofferIceRestart = true;
+    logMsg('本地正在协商中，本次 Offer 已排队稍后重试', 'warn');
+    return;
+  }
+  try {
+    makingOffer = true;
+    reportNegotiationState(true);
+    const offer = await pc.createOffer(iceRestart ? { iceRestart: true } : undefined);
+    await pc.setLocalDescription(offer);
+    sendMsg({ type: 'offer', data: { sdp: offer.sdp } });
+  } catch (e) {
+    logMsg('发起协商失败: ' + e.message, 'error');
+    reportNegotiationState(false);
+  } finally {
+    makingOffer = false;
+  }
+}
+
+// resetIceRestartState 通话恢复或结束时重置 ICE 重启状态
+function resetIceRestartState() {
+  iceRestartAttempts = 0;
+  if (iceRestartTimer) { clearTimeout(iceRestartTimer); iceRestartTimer = null; }
+}
+
+// scheduleIceRestart ICE 断开时的主动恢复流程
+// 背景：disconnected/failed 意味着连通性检查已失败（弱网丢包、NAT 端口映射变化等）。
+// 仅靠自己"等"往往无法恢复，必须主动 restartIce 并重协商，让两端重新交换
+// ICE 凭据与候选。这里带退避重试，若期间恢复为 connected 会被重置。
+function scheduleIceRestart(reason) {
+  if (!pc) return;
+  if (iceRestartAttempts >= ICE_RESTART_MAX_ATTEMPTS) return;
+  if (iceRestartTimer) return; // 已有一次恢复流程在排队，避免重复触发
+
+  iceRestartAttempts++;
+  logMsg(`ICE 异常(${reason})，发起第 ${iceRestartAttempts} 次 ICE 重启`, 'warn');
+
+  // 标记后续 createOffer 生成 ICE 重启 Offer（标准 API，部分旧浏览器不支持则忽略）
+  try { if (typeof pc.restartIce === 'function') pc.restartIce(); } catch (e) {}
+
+  // 退避后执行重协商；若本地正忙则再排一轮
+  const delay = Math.min(500 * iceRestartAttempts, 2000);
+  iceRestartTimer = setTimeout(() => {
+    iceRestartTimer = null;
+    if (!pc) return;
+    const st = pc.iceConnectionState;
+    if (st === 'connected' || st === 'completed') return; // 已自行恢复
+    if (pc.signalingState === 'stable') {
+      makeOffer(true);
+    } else {
+      scheduleIceRestart('本地协商中');
+    }
+  }, delay);
+}
+
+// 处理服务器 Offer（perfect negotiation：客户端作为 polite 一方）
+async function handleServerOffer(sdp) {
+  if (!pc) return;
+
+  try {
+    if (pc.signalingState === 'have-local-offer') {
+      // 协商冲突（glare）：本地刚发出 Offer 还未收到 Answer，同时又收到服务器 Offer。
+      // 客户端主动回滚本地 Offer，优先接受服务器的 Offer，随后再重发自己的 Offer
+      logMsg('检测到协商冲突，回滚本地 Offer 以接受服务器 Offer', 'warn');
+      try {
+        await pc.setLocalDescription({ type: 'rollback' });
+        needReoffer = true;
+      } catch (e) {
+        logMsg('回滚本地 Offer 失败，请求服务器稍后重试: ' + e.message, 'warn');
+        sendMsg({ type: 'renegotiate_retry' });
+        return;
+      }
+    } else if (pc.signalingState !== 'stable') {
+      // 其他中间态（如 have-remote-offer）无法立刻处理，请求服务器稍后重试
+      logMsg('本地协商进行中，已请求服务器稍后重试', 'warn');
+      sendMsg({ type: 'renegotiate_retry' });
+      return;
+    }
+
+    makingOffer = false;
+    reportNegotiationState(true);
+    await pc.setRemoteDescription({ type: 'offer', sdp });
+    const answer = await pc.createAnswer();
+    await pc.setLocalDescription(answer);
+    sendMsg({ type: 'answer', data: { sdp: answer.sdp } });
+
+    // 回滚丢失了本地 Offer，需要重新发起一次以完成发布协商
+    if (needReoffer) {
+      needReoffer = false;
+      setTimeout(() => { makeOffer(); }, 500);
+    }
+  } catch (e) {
+    logMsg('处理服务器 Offer 失败: ' + e.message, 'error');
+    reportNegotiationState(false);
+  }
+}
+
+// 处理服务器 Answer
+async function handleServerAnswer(sdp) {
+  if (!pc) return;
+  try {
+    await pc.setRemoteDescription({ type: 'answer', sdp });
+  } catch (e) {
+    logMsg('设置 Answer 失败: ' + e.message, 'error');
+  } finally {
+    reportNegotiationState(false);
+    flushPendingSubscribes();
+  }
+}
+
+// ============================================================
+// 服务端消息处理
+// ============================================================
+function handleServerMsg(msg) {
+  switch (msg.type) {
+    case 'join_success':
+      logMsg(`已加入房间 ${msg.data.roomId}`, 'success');
+      $('loginView').classList.remove('active');
+      $('mainView').classList.add('active');
+      initPC();
+      break;
+
+    case 'sessions_list': {
+      const list = msg.data.sessions || [];
+      list.forEach(u => {
+        if (u && u.sessionId && u.sessionId !== sessionId) {
+          onlineUsers.set(u.sessionId, u.name || u.sessionId);
+        }
+      });
+      renderContacts();
+      if (list.length > 0) logMsg(`房间内已有 ${list.length} 位用户`);
+      break;
+    }
+
+    case 'session_join':
+      if (msg.data.sessionId !== sessionId) {
+        onlineUsers.set(msg.data.sessionId, msg.data.name || msg.data.sessionId);
+        renderContacts();
+        logMsg(`用户 ${peerName(msg.data.sessionId)} 上线`);
+      }
+      break;
+
+    case 'session_leave': {
+      const leaveName = peerName(msg.data.sessionId);
+      onlineUsers.delete(msg.data.sessionId);
+      renderContacts();
+      logMsg(`用户 ${leaveName} 下线`, 'warn');
+      if (callPeer === msg.data.sessionId && callState !== 'idle') {
+        logMsg('通话对方已下线', 'warn');
+        endCall(false);
+      }
+      break;
+    }
+
+    case 'tracks_list':
+    case 'track_published':
+    case 'track_unpublished':
+      handleTrackEvent(msg);
+      break;
+
+    case 'offer':
+      handleServerOffer(msg.data.sdp);
+      break;
+
+    case 'answer':
+      handleServerAnswer(msg.data.sdp);
+      break;
+
+    case 'ice_candidate':
+      handleICECandidate(msg.data);
+      break;
+
+    case 'call_request':
+      handleIncomingCall(msg.data);
+      break;
+
+    case 'call_accept':
+      handleCallAccepted(msg.data);
+      break;
+
+    case 'call_reject':
+      handleCallRejected(msg.data);
+      break;
+
+    case 'call_end':
+      handleCallEnded(msg.data);
+      break;
+
+    case 'error':
+      logMsg('服务器错误: ' + (msg.data.message || JSON.stringify(msg.data)), 'error');
+      toast(msg.data.message || '服务器返回错误');
+      break;
+
+    case 'pong':
+      break;
+  }
+}
+
+// ============================================================
+// PeerConnection
+// ============================================================
+function initPC() {
+  if (pc) return;
+  // 默认 STUN 服务器（多个备选，提升 NAT 穿透成功率）
+  const stunServers = [
+    'stun:stun.chat.bilibili.com:3478',
+    'stun:stun.cloudflare.com:3478',
+    'stun:stun.miwifi.com:3478'
+  ];
+  // TURN 中继配置：当两台设备处在同一个 NAT 出口（例如连接同一个 WiFi）导致
+  // 直连打洞失败时，TURN 中继是唯一可靠的兜底。
+  // 优先级：服务端注入的内嵌 TURN > URL 参数手动指定。
+  const qs = new URLSearchParams(location.search);
+  const iceServers = [{ urls: stunServers }];
+
+  // 服务端注入的内嵌 TURN（集成在 exe 内，打开页面即生效，无需任何手动配置）
+  const injectedTurn = window.__YSP_TURN__;
+  if (injectedTurn && Array.isArray(injectedTurn.urls) && injectedTurn.urls.length) {
+    iceServers.push(injectedTurn);
+    logMsg('已启用内嵌 TURN 中继: ' + injectedTurn.urls.join(','), 'success');
+  } else {
+    logMsg('内嵌 TURN 未启用，将仅依赖直连打洞', 'warn');
+  }
+
+  // 手动指定外部 TURN（可选，覆盖兜底）：
+  // 用法：?turn=turn:host:3478&turnuser=用户名&turnpass=密码
+  const turnParam = qs.get('turn');
+  if (turnParam) {
+    const turnCfg = { urls: turnParam.split(',').map(s => s.trim()).filter(Boolean) };
+    if (qs.get('turnuser')) turnCfg.username = qs.get('turnuser');
+    if (qs.get('turnpass')) turnCfg.credential = qs.get('turnpass');
+    iceServers.push(turnCfg);
+    logMsg('已启用外部 TURN 中继: ' + turnCfg.urls.join(','), 'info');
+  }
+  pc = new RTCPeerConnection({ iceServers });
+
+  pc.oniceconnectionstatechange = () => {
+    const st = pc.iceConnectionState;
+    const on = (st === 'connected' || st === 'completed');
+    setDot('iceDot', on ? 'on' : (st === 'checking' ? '' : 'off'));
+    if (callState !== 'idle') logMsg('ICE: ' + st, on ? 'success' : 'info');
+
+    if (on) {
+      // 已连通：清空 ICE 重启计数，允许下次断线重新触发恢复
+      resetIceRestartState();
+    } else if (callState !== 'idle' && (st === 'disconnected' || st === 'failed')) {
+      // 断开/失败：主动重启 ICE 并重协商，避免一直停在 disconnected
+      // 直到服务端 15s 宽限期超时关闭会话
+      scheduleIceRestart(st);
+    }
+  };
+
+  pc.onicecandidate = (e) => {
+    if (e.candidate) {
+      sendMsg({
+        type: 'ice_candidate',
+        data: {
+          candidate: e.candidate.candidate,
+          sdpMid: e.candidate.sdpMid,
+          sdpMLineIndex: e.candidate.sdpMLineIndex
+        }
+      });
+    }
+  };
+
+  pc.ontrack = (e) => handleRemoteTrack(e);
+
+  // 信令状态回到 stable 时，自动补发排队的订阅请求并上报空闲
+  // 这是关键：排队的订阅不能只等 answer 回调，否则一旦当时不是 stable 就永远发不出去
+  pc.addEventListener('signalingstatechange', () => {
+    if (pc && pc.signalingState === 'stable') {
+      reportNegotiationState(false);
+      flushPendingSubscribes();
+      // 补发此前因本地正忙被排队的 Offer（例如挂断紧接再次接听）
+      if (pendingReoffer) {
+        pendingReoffer = false;
+        const ir = pendingReofferIceRestart;
+        pendingReofferIceRestart = false;
+        setTimeout(() => makeOffer(ir), 300);
+      }
+    }
+  });
+}
+
+function cleanupPC() {
+  if (pc) { try { pc.close(); } catch (e) {} pc = null; }
+  if (localStream) { localStream.getTracks().forEach(t => t.stop()); localStream = null; }
+  if (fakeTimer) { clearInterval(fakeTimer); fakeTimer = null; }
+  makingOffer = false;
+  pendingSubscribes = [];
+  pendingReoffer = false;
+  pendingReofferIceRestart = false;
+  resetIceRestartState();
+  subscribedKeys.clear();
+}
+
+function ensurePC() {
+  if (pc && pc.connectionState !== 'closed') return;
+  cleanupPC();
+  initPC();
+}
+
+async function handleICECandidate(data) {
+  if (!pc) return;
+  try { await pc.addIceCandidate(new RTCIceCandidate(data)); } catch (e) {}
+}
+
+// ============================================================
+// 设备管理
+// ============================================================
+function isMobileDevice() {
+  return /Android|iPhone|iPad|iPod|Windows Phone|Mobile/i.test(navigator.userAgent);
+}
+
+function withTimeout(promise, ms, errMsg) {
+  return Promise.race([
+    promise,
+    new Promise((_, rej) => setTimeout(() => rej(new Error(errMsg || '设备采集超时')), ms))
+  ]);
+}
+
+async function refreshDevices() {
+  if (!navigator.mediaDevices || !navigator.mediaDevices.enumerateDevices) {
+    logMsg('当前浏览器不支持设备枚举', 'warn');
+    return;
+  }
+  try {
+    const list = await navigator.mediaDevices.enumerateDevices();
+    camDevices = list.filter(d => d.kind === 'videoinput');
+    micDevices = list.filter(d => d.kind === 'audioinput');
+    if (isMobileDevice() && !camInitialized && selectedCamId === '') {
+      selectedCamId = CAM_FRONT;
+      camInitialized = true;
+    }
+    renderDeviceSelects();
+  } catch (e) {
+    logMsg('枚举设备失败: ' + e.message, 'warn');
+  }
+}
+
+function renderDeviceSelects() {
+  let camHtml = '<option value="">默认摄像头</option>';
+  if (isMobileDevice()) {
+    camHtml += `<option value="${CAM_FRONT}"${selectedCamId === CAM_FRONT ? ' selected' : ''}>前置摄像头</option>`;
+    camHtml += `<option value="${CAM_BACK}"${selectedCamId === CAM_BACK ? ' selected' : ''}>后置摄像头</option>`;
+  }
+  camDevices.forEach((d, i) => {
+    const label = d.label || ('摄像头 ' + (i + 1));
+    camHtml += `<option value="${d.deviceId}"${d.deviceId === selectedCamId ? ' selected' : ''}>${label}</option>`;
+  });
+
+  let micHtml = '<option value="">默认麦克风</option>';
+  micDevices.forEach((d, i) => {
+    const label = d.label || ('麦克风 ' + (i + 1));
+    micHtml += `<option value="${d.deviceId}"${d.deviceId === selectedMicId ? ' selected' : ''}>${label}</option>`;
+  });
+
+  ['cameraSelect', 'cameraSelectMain', 'cameraSelectCall'].forEach(id => {
+    const el = $(id);
+    if (el) el.innerHTML = camHtml;
+  });
+  ['micSelect', 'micSelectMain', 'micSelectCall'].forEach(id => {
+    const el = $(id);
+    if (el) el.innerHTML = micHtml;
+  });
+}
+
+// 视频码率上限：2.5 Mbps（配合 1080p 采集，好网络下画面更清晰）
+// 服务器公网带宽 200Mbps，转发侧完全不是瓶颈，真正的上限在手机的上行网络。
+// 上限设高一些，好网络能给出清晰画面；网络变差时由 WebRTC 的 TWCC
+// 拥塞控制自动降码率，不会把上行链路挤爆。
+const VIDEO_MAX_BITRATE = 2500000;
+
+// 通话采集参数（用 ideal 约束，浏览器会按设备实际能力选择最接近的分辨率，
+// 不会因为设备不支持 1080p 而直接失败）
+// 说明：采集端给到 1080p@30，配合 tuneSenders 里的 balanced 降级策略，
+// 好网络出高清画面，弱网络由编码器自动降分辨率/帧率来保流畅。
+function hdVideoProfile() {
+  return {
+    width: { ideal: 1920 },
+    height: { ideal: 1080 },
+    frameRate: { ideal: 30, max: 30 }
+  };
+}
+
+function buildVideoConstraint(value) {
+  const base = hdVideoProfile();
+  if (value === CAM_FRONT) return Object.assign({}, base, { facingMode: 'user' });
+  if (value === CAM_BACK) return Object.assign({}, base, { facingMode: { ideal: 'environment' } });
+  if (value) return Object.assign({}, base, { deviceId: { exact: value } });
+  return base;
+}
+
+async function getCameraStream(value) {
+  try {
+    return await withTimeout(
+      navigator.mediaDevices.getUserMedia({ video: buildVideoConstraint(value) }),
+      8000, '摄像头采集超时'
+    );
+  } catch (e) {
+    if (value === CAM_BACK) {
+      return await withTimeout(navigator.mediaDevices.getUserMedia({ video: Object.assign({}, hdVideoProfile(), { facingMode: 'environment' }) }), 8000, '后置摄像头采集超时');
+    }
+    if (value === CAM_FRONT) {
+      return await withTimeout(navigator.mediaDevices.getUserMedia({ video: Object.assign({}, hdVideoProfile(), { facingMode: 'user' }) }), 8000, '前置摄像头采集超时');
+    }
+    throw e;
+  }
+}
+
+function describeCamera(value, track) {
+  if (value === CAM_FRONT) return '前置摄像头';
+  if (value === CAM_BACK) return '后置摄像头';
+  if (track && track.label) return track.label;
+  return value || '默认摄像头';
+}
+
+function updateLocalMirror() {
+  const lv = $('localVideo');
+  if (!lv) return;
+  const track = localStream ? localStream.getVideoTracks()[0] : null;
+  let mirror = false;
+  if (track && track.getSettings) mirror = track.getSettings().facingMode === 'user';
+  lv.style.transform = mirror ? 'scaleX(-1)' : 'none';
+}
+
+function refreshLocalPreview() {
+  const lv = $('localVideo');
+  if (lv && localStream) lv.srcObject = localStream;
+  updateLocalMirror();
+}
+
+async function replaceLocalVideoTrack(newTrack) {
+  const sender = pc ? pc.getSenders().find(s => s.track && s.track.kind === 'video') : null;
+  if (sender) await sender.replaceTrack(newTrack);
+  const oldTrack = localStream ? localStream.getVideoTracks()[0] : null;
+  if (oldTrack && oldTrack !== newTrack) { oldTrack.stop(); localStream.removeTrack(oldTrack); }
+  if (localStream) localStream.addTrack(newTrack);
+  newTrack.enabled = isCameraOn;
+  refreshLocalPreview();
+}
+
+async function switchCamera(value) {
+  if (!localStream) return;
+  const oldTrack = localStream.getVideoTracks()[0] || null;
+  let newTrack = null;
+
+  try {
+    const s = await getCameraStream(value);
+    newTrack = s.getVideoTracks()[0];
+  } catch (e1) {
+    if (oldTrack) {
+      oldTrack.stop();
+      localStream.removeTrack(oldTrack);
+      try {
+        const s = await getCameraStream(value);
+        newTrack = s.getVideoTracks()[0];
+      } catch (e2) {
+        logMsg('切换摄像头失败: ' + e2.message, 'error');
+        toast('切换摄像头失败');
+        return;
+      }
+    } else {
+      logMsg('切换摄像头失败: ' + e1.message, 'error');
+      return;
+    }
+  }
+
+  if (!newTrack) return;
+  try {
+    await replaceLocalVideoTrack(newTrack);
+  } catch (e) {
+    logMsg('替换视频轨道失败: ' + e.message, 'error');
+    return;
+  }
+  usingFakeMedia = false;
+  logMsg('已切换摄像头: ' + describeCamera(value, newTrack), 'success');
+  toast('已切换摄像头');
+  refreshDevices();
+}
+
+async function switchMic(deviceId) {
+  const constraint = buildAudioConstraint(deviceId);
+  let newTrack = null;
+
+  try {
+    const stream = await withTimeout(navigator.mediaDevices.getUserMedia({ audio: constraint }), 8000, '麦克风采集超时');
+    newTrack = stream.getAudioTracks()[0];
+  } catch (e1) {
+    const oldTrack = localStream ? localStream.getAudioTracks()[0] : null;
+    if (oldTrack) {
+      oldTrack.stop();
+      localStream.removeTrack(oldTrack);
+      try {
+        const stream = await withTimeout(navigator.mediaDevices.getUserMedia({ audio: constraint }), 8000, '麦克风采集超时');
+        newTrack = stream.getAudioTracks()[0];
+      } catch (e2) {
+        logMsg('切换麦克风失败: ' + e2.message, 'error');
+        toast('切换麦克风失败');
+        return;
+      }
+    } else {
+      logMsg('切换麦克风失败: ' + e1.message, 'error');
+      return;
+    }
+  }
+
+  if (!newTrack) return;
+  try {
+    const sender = pc ? pc.getSenders().find(s => s.track && s.track.kind === 'audio') : null;
+    if (sender) await sender.replaceTrack(newTrack);
+    const oldTrack = localStream ? localStream.getAudioTracks()[0] : null;
+    if (oldTrack && oldTrack !== newTrack) { oldTrack.stop(); localStream.removeTrack(oldTrack); }
+    if (localStream) localStream.addTrack(newTrack);
+    newTrack.enabled = !isMuted;
+  } catch (e) {
+    logMsg('替换音频轨道失败: ' + e.message, 'error');
+    return;
+  }
+  usingFakeMedia = false;
+  logMsg('已切换麦克风: ' + (newTrack.label || '未知设备'), 'success');
+  toast('已切换麦克风');
+  refreshDevices();
+}
+
+async function flipCamera() {
+  const next = (selectedCamId === CAM_BACK) ? CAM_FRONT : CAM_BACK;
+  selectedCamId = next;
+  renderDeviceSelects();
+  if (callState === 'connected' && localStream) {
+    await switchCamera(next);
+  } else {
+    logMsg('摄像头已选择: ' + describeCamera(next, null));
+  }
+}
+
+function onCameraSelect(value) {
+  selectedCamId = value;
+  renderDeviceSelects();
+  if (callState === 'connected' && localStream) switchCamera(value);
+  else logMsg('摄像头已选择: ' + describeCamera(value, null));
+}
+
+function onMicSelect(value) {
+  selectedMicId = value;
+  renderDeviceSelects();
+  if (callState === 'connected' && localStream) switchMic(value);
+  else logMsg('麦克风已选择: ' + (value || '默认麦克风'));
+}
+
+// ============================================================
+// 媒体发布
+// ============================================================
+function createFakeStream(type) {
+  const stream = new MediaStream();
+  try {
+    const ac = new (window.AudioContext || window.webkitAudioContext)();
+    if (ac.state === 'suspended') ac.resume().catch(() => {});
+    const osc = ac.createOscillator();
+    const gain = ac.createGain();
+    const dst = ac.createMediaStreamDestination();
+    osc.frequency.value = 440;
+    gain.gain.value = 0.01;
+    osc.connect(gain); gain.connect(dst); osc.start();
+    dst.stream.getAudioTracks().forEach(t => stream.addTrack(t));
+  } catch (e) {
+    logMsg('模拟音频创建失败: ' + e.message, 'warn');
+  }
+
+  if (type === 'video') {
+    const W = 1280, H = 720;
+    const canvas = document.createElement('canvas');
+    canvas.width = W; canvas.height = H;
+    const ctx = canvas.getContext('2d');
+    let t = 0;
+    fakeTimer = setInterval(() => {
+      t += 0.06;
+      ctx.fillStyle = '#101a30';
+      ctx.fillRect(0, 0, W, H);
+      ctx.fillStyle = '#38bdf8';
+      ctx.font = 'bold 72px sans-serif';
+      ctx.fillText('模拟画面', 60, 180);
+      ctx.fillStyle = '#e8eefc';
+      ctx.font = '54px sans-serif';
+      ctx.fillText(userName, 60, 264);
+      ctx.fillStyle = '#5b6b85';
+      ctx.font = '36px sans-serif';
+      ctx.fillText('1280 x 720', 60, 330);
+      ctx.beginPath();
+      ctx.arc(W / 2, H - 180, 90 + Math.sin(t) * 40, 0, Math.PI * 2);
+      ctx.fillStyle = '#22c55e';
+      ctx.fill();
+    }, 33);
+    canvas.captureStream(30).getVideoTracks().forEach(t => stream.addTrack(t));
+  }
+  return stream;
+}
+
+// tuneSenders 设置发送参数
+// 关键点：
+//   1) 视频码率上限 2.5 Mbps + 30fps，配合 1080p 采集，好网络下画面清晰；
+//   2) degradationPreference = balanced：带宽紧张时同时适度降分辨率和帧率，
+//      始终保证画面流畅。若用 maintain-resolution，会死保分辨率、把帧率压到
+//      个位数，画面就会“卡成 PPT”。
+//   3) 音频提到 96 kbps（Opus），语音更清晰。
+async function tuneSenders() {
+  if (!pc) return;
+  for (const s of pc.getSenders()) {
+    if (!s.track) continue;
+    try {
+      const params = s.getParameters();
+      if (!params.encodings || params.encodings.length === 0) params.encodings = [{}];
+      if (s.track.kind === 'video') {
+        params.encodings[0].maxBitrate = VIDEO_MAX_BITRATE;
+        params.encodings[0].maxFramerate = 30;
+        // 带宽紧张时均衡降级（部分浏览器不支持该字段，失败会走 catch）
+        params.degradationPreference = 'balanced';
+      } else {
+        params.encodings[0].maxBitrate = 96000;   // 96 kbps（Opus）
+      }
+      await s.setParameters(params);
+    } catch (e) {
+      // 宽松重试：只设置码率，不改 degradationPreference
+      try {
+        const p2 = s.getParameters();
+        if (!p2.encodings || p2.encodings.length === 0) p2.encodings = [{}];
+        p2.encodings[0].maxBitrate = s.track.kind === 'video' ? VIDEO_MAX_BITRATE : 96000;
+        await s.setParameters(p2);
+      } catch (e2) {}
+    }
+  }
+}
+
+// buildAudioConstraint 统一的音频采集约束
+// 显式开启浏览器原生音频处理，这是抑制通话回声/啸叫最关键的一步：
+//   echoCancellation 回声消除（AEC）：把本机扬声器串入麦克风的远端声音减掉，打断回声正反馈环路
+//   noiseSuppression 噪声抑制、autoGainControl 自动增益
+// 若不显式设置，部分浏览器/WebView 可能不开 AEC，导致对方声音在本机来回复制形成无限回音。
+function buildAudioConstraint(deviceId) {
+  const c = {
+    echoCancellation: true,
+    noiseSuppression: true,
+    autoGainControl: true,
+  };
+  if (deviceId) c.deviceId = { exact: deviceId };
+  return c;
+}
+
+async function publishMedia(type) {
+  ensurePC();
+  try {
+    const audioConstraint = buildAudioConstraint(selectedMicId);
+    const videoConstraint = buildVideoConstraint(selectedCamId);
+    const constraints = type === 'video'
+      ? { video: videoConstraint, audio: audioConstraint }
+      : { video: false, audio: audioConstraint };
+
+    try {
+      localStream = await withTimeout(navigator.mediaDevices.getUserMedia(constraints), 6000, '设备采集超时');
+      usingFakeMedia = false;
+    } catch (e) {
+      logMsg('真实设备采集失败(' + (e.name || e.message) + ')，使用模拟媒体', 'warn');
+      localStream = createFakeStream(type);
+      usingFakeMedia = true;
+    }
+
+    localStream.getTracks().forEach(t => pc.addTrack(t, localStream));
+    await tuneSenders();
+    refreshLocalPreview();
+
+    // 记录实际采集到的分辨率，便于排查画质问题
+    const vt = localStream.getVideoTracks()[0];
+    if (vt && vt.getSettings) {
+      const st = vt.getSettings();
+      if (st.width && st.height) logMsg(`采集分辨率: ${st.width}x${st.height} @${st.frameRate || 0}fps`);
+    }
+
+    // 走统一的协商入口，避免与服务器 Offer 冲突
+    await makeOffer();
+    logMsg(`已发布${type === 'video' ? '音视频' : '音频'}流${usingFakeMedia ? '（模拟）' : ''}`, 'success');
+    refreshDevices();
+  } catch (e) {
+    logMsg('采集媒体失败: ' + e.message, 'error');
+    throw e;
+  }
+}
+
+// ============================================================
+// 轨道订阅
+// ============================================================
+function handleTrackEvent(msg) {
+  if (callState !== 'connected' || !callPeer) return;
+
+  if (msg.type === 'track_published' && msg.data.sessionId === callPeer) {
+    subscribeTrack(msg.data.sessionId, msg.data.trackId);
+  }
+  if (msg.type === 'tracks_list') {
+    (msg.data.tracks || []).forEach(t => {
+      if (t.sessionId === callPeer) subscribeTrack(t.sessionId, t.trackId);
+    });
+  }
+}
+
+// subscribeTrack 本地协商中时排队，避免与服务器 Offer 冲突
+function subscribeTrack(publisherId, trackId) {
+  if (isNegotiating()) {
+    pendingSubscribes.push({ publisherId, trackId });
+    logMsg('本地协商中，订阅请求已排队');
+    return;
+  }
+  doSubscribe(publisherId, trackId);
+}
+
+function doSubscribe(publisherId, trackId) {
+  const key = publisherId + ':' + trackId;
+  if (subscribedKeys.has(key)) return; // 已订阅过，避免重复订阅造成同路音频叠加
+  subscribedKeys.add(key);
+  sendMsg({ type: 'subscribe', data: { publisherId, trackId } });
+}
+
+// 协商空闲后发送排队的订阅请求
+// 一次只发一个：服务器收到 subscribe 后要发起重协商，逐个发送可避免多轮协商并发
+function flushPendingSubscribes() {
+  if (!pc || pendingSubscribes.length === 0) return;
+  // 正在协商时先不发，等信令回到 stable 的事件回调再次触发
+  if (pc.signalingState !== 'stable') return;
+
+  const s = pendingSubscribes.shift();
+  doSubscribe(s.publisherId, s.trackId);
+
+  // 仍有剩余：稍后再发下一个（此时信令状态可能没变化，需要主动再试）
+  if (pendingSubscribes.length > 0) {
+    setTimeout(flushPendingSubscribes, 700);
+  }
+}
+
+// safePlay 安全播放
+// iOS Safari 对带声音的媒体要求用户手势才能播放，这里统一处理失败情况
+function safePlay(el) {
+  if (!el) return;
+  const p = el.play();
+  if (p && typeof p.catch === 'function') {
+    p.catch(() => {
+      autoPlayBlocked = true;
+      $('tapHint').classList.add('show');
+      logMsg('浏览器阻止了自动播放，轻触屏幕即可恢复声音', 'warn');
+    });
+  }
+}
+
+// resumeMediaPlayback 用户手势后恢复被阻止的媒体播放（iOS 必需）
+function resumeMediaPlayback() {
+  if (!autoPlayBlocked) return;
+  let allOk = true;
+  document.querySelectorAll('video, audio').forEach(el => {
+    if (el.srcObject) {
+      const p = el.play();
+      if (p && typeof p.catch === 'function') p.catch(() => { allOk = false; });
+    }
+  });
+  if (allOk) {
+    autoPlayBlocked = false;
+    $('tapHint').classList.remove('show');
+  }
+}
+
+function handleRemoteTrack(e) {
+  const track = e.track;
+
+  if (track.kind === 'video') {
+    // 远端视频只负责出画面：video 元素已 muted，音频全部交给 remoteAudio 播放。
+    // 这样可避免同一路远端音频被 video 元素和 audio 元素同时播放（双播会叠加音量、加重回声）。
+    const rv = $('remoteVideo');
+    if (!rv.srcObject) rv.srcObject = new MediaStream();
+    if (!rv.srcObject.getTracks().some(t => t.id === track.id)) rv.srcObject.addTrack(track);
+    rv.muted = true;
+    $('audioStage').classList.remove('active');
+    rv.style.display = '';
+    safePlay(rv);
+  } else if (track.kind === 'audio') {
+    // 全部远端音频统一走单一的 remoteAudio 元素，且同一轨道只挂载一次，
+    // 防止多次 ontrack 叠加出多个音源导致回声/啸叫被放大。
+    const ra = $('remoteAudio');
+    if (!ra.srcObject) ra.srcObject = new MediaStream();
+    if (!ra.srcObject.getTracks().some(t => t.id === track.id)) ra.srcObject.addTrack(track);
+    safePlay(ra);
+  }
+  logMsg(`收到远端${track.kind === 'video' ? '视频' : '音频'}轨道`, 'success');
+}
+
+// ============================================================
+// 通话音效（纯 WebAudio 合成，不依赖外部音频文件，方便单 exe 内嵌）
+//   拨打方：回铃音；接收方：来电铃声；双方：挂断/拒绝提示音
+// ============================================================
+let toneCtx = null;     // 复用的音频上下文
+let toneTimer = null;   // 循环播放音效的定时器
+let toneKind = '';      // 当前正在循环播放的音效类型
+
+// getToneCtx 延迟创建音频上下文并尝试恢复
+// 浏览器自动播放策略：无用户手势时 AudioContext 可能处于 suspended，需要 resume
+function getToneCtx() {
+  const AC = window.AudioContext || window.webkitAudioContext;
+  if (!AC) return null;
+  if (!toneCtx) toneCtx = new AC();
+  if (toneCtx.state === 'suspended') { try { toneCtx.resume(); } catch (e) {} }
+  return toneCtx;
+}
+
+// playBeep 播放一段正弦提示音（freq 频率 Hz、dur 时长 s、delay 延时 s、vol 音量）
+function playBeep(freq, dur, delay, vol) {
+  const ctx = getToneCtx();
+  if (!ctx) return;
+  const t0 = ctx.currentTime + (delay || 0);
+  const v = (vol == null) ? 0.16 : vol;
+  const osc = ctx.createOscillator();
+  const gain = ctx.createGain();
+  osc.type = 'sine';
+  osc.frequency.setValueAtTime(freq, t0);
+  // 音量包络：短促淡入淡出，避免爆音
+  gain.gain.setValueAtTime(0, t0);
+  gain.gain.linearRampToValueAtTime(v, t0 + 0.02);
+  gain.gain.setValueAtTime(v, t0 + Math.max(0.03, dur - 0.05));
+  gain.gain.linearRampToValueAtTime(0, t0 + dur);
+  osc.connect(gain);
+  gain.connect(ctx.destination);
+  osc.start(t0);
+  osc.stop(t0 + dur + 0.03);
+}
+
+// stopCallTone 停止循环中的通话音效
+function stopCallTone() {
+  if (toneTimer) { clearTimeout(toneTimer); toneTimer = null; }
+  toneKind = '';
+}
+
+// playCallTone 循环播放通话音效
+//   'outgoing' 拨打方回铃音：450Hz，响 1s、停 3.5s
+//   'incoming' 接收方来电铃声：高低音交替，节奏更急促
+function playCallTone(kind) {
+  if (toneKind === kind) return; // 同种音效正在播放，避免重复叠加
+  stopCallTone();
+  toneKind = kind;
+
+  if (kind === 'outgoing') {
+    const loop = () => {
+      if (toneKind !== 'outgoing') return;
+      playBeep(450, 0.9, 0, 0.14);
+      toneTimer = setTimeout(loop, 4000);
+    };
+    loop();
+  } else if (kind === 'incoming') {
+    const loop = () => {
+      if (toneKind !== 'incoming') return;
+      playBeep(880, 0.16, 0, 0.20);
+      playBeep(660, 0.16, 0.22, 0.20);
+      playBeep(880, 0.16, 0.44, 0.20);
+      playBeep(660, 0.16, 0.66, 0.20);
+      toneTimer = setTimeout(loop, 2000);
+    };
+    loop();
+  }
+}
+
+// playHangupTone 挂断/拒绝提示音（两声下行短音）
+function playHangupTone() {
+  playBeep(420, 0.18, 0, 0.16);
+  playBeep(300, 0.22, 0.22, 0.16);
+}
+
+// ============================================================
+// 音频输出切换（扬声器 / 听筒）
+// 浏览器没有直接控制"听筒"的接口，这里用 HTMLMediaElement.setSinkId
+// 把远端声音输出到不同音频设备：Android Chrome 等支持，iOS Safari 不支持。
+// 设备名需要先有麦克风授权（通话中已授权）才能读到。
+// ============================================================
+let speakerOn = true;    // 当前是否外放（扬声器）
+let audioOutputs = [];   // 可用的音频输出设备列表
+
+// refreshAudioOutputs 枚举音频输出设备
+async function refreshAudioOutputs() {
+  audioOutputs = [];
+  if (!navigator.mediaDevices || !navigator.mediaDevices.enumerateDevices) return;
+  try {
+    const devs = await navigator.mediaDevices.enumerateDevices();
+    audioOutputs = devs.filter(d => d.kind === 'audiooutput');
+  } catch (e) {}
+}
+
+// setAudioOutput 把远端音视频元素的声音输出到指定设备
+async function setAudioOutput(sinkId) {
+  const els = [$('remoteAudio'), $('remoteVideo')].filter(Boolean);
+  let ok = true;
+  for (const el of els) {
+    if (typeof el.setSinkId !== 'function') { ok = false; continue; }
+    try { await el.setSinkId(sinkId); } catch (e) { ok = false; logMsg('切换输出设备失败: ' + e.message, 'warn'); }
+  }
+  return ok;
+}
+
+// updateSpeakerBtn 刷新扬声器按钮的图标与高亮状态
+function updateSpeakerBtn() {
+  const btn = $('speakerBtn');
+  if (!btn) return;
+  setBtnIcon(btn, speakerOn ? 'speaker' : 'speaker-off');
+  btn.classList.toggle('off', !speakerOn);
+}
+
+// toggleSpeaker 在"扬声器（外放）"与"听筒"之间切换
+async function toggleSpeaker() {
+  const supports = typeof HTMLMediaElement !== 'undefined' && 'setSinkId' in HTMLMediaElement.prototype;
+  if (!supports) {
+    toast('当前浏览器不支持切换听筒/扬声器');
+    logMsg('浏览器不支持 setSinkId，无法切换音频输出', 'warn');
+    return;
+  }
+
+  await refreshAudioOutputs();
+
+  // 按设备名匹配听筒 / 扬声器（不同平台命名不一，做了多关键词兜底）
+  const earpiece = audioOutputs.find(d => /听筒|受话器|耳机|earpiece|receiver|headset|earphone/i.test(d.label || ''));
+  const speakerDev = audioOutputs.find(d => /扬声器|外放|speaker/i.test(d.label || ''))
+    || audioOutputs.find(d => d.deviceId === 'default')
+    || audioOutputs[0];
+
+  if (speakerOn) {
+    // 外放 -> 听筒
+    if (!earpiece) {
+      toast('未检测到听筒设备');
+      logMsg('输出设备: ' + (audioOutputs.map(d => d.label || d.deviceId).join(' / ') || '无'), 'warn');
+      return;
+    }
+    if (!await setAudioOutput(earpiece.deviceId)) { toast('切换到听筒失败'); return; }
+    speakerOn = false;
+    logMsg('音频输出已切换到听筒: ' + (earpiece.label || earpiece.deviceId), 'success');
+    toast('已切换到听筒');
+  } else {
+    // 听筒 -> 外放
+    if (!speakerDev) { toast('未检测到扬声器设备'); return; }
+    if (!await setAudioOutput(speakerDev.deviceId)) { toast('切换到扬声器失败'); return; }
+    speakerOn = true;
+    logMsg('音频输出已切换到扬声器: ' + (speakerDev.label || speakerDev.deviceId), 'success');
+    toast('已切换到扬声器');
+  }
+  updateSpeakerBtn();
+}
+
+// ============================================================
+// 通话控制
+// ============================================================
+function startCall(targetId, type) {
+  callPeer = targetId;
+  callType = type;
+  callState = 'calling';
+  showCallView();
+  $('audioDesc').textContent = '正在呼叫...';
+  $('callTimer').textContent = '正在呼叫...';
+  logMsg(`向 ${peerName(targetId)} 发起${type === 'video' ? '视频' : '语音'}通话`);
+  sendMsg({ type: 'call_request', data: { to: targetId, callType: type } });
+  playCallTone('outgoing');
+}
+
+function handleIncomingCall(data) {
+  if (callState !== 'idle') {
+    sendMsg({ type: 'call_reject', data: { to: data.from } });
+    return;
+  }
+  callPeer = data.from;
+  callType = data.callType || 'video';
+  callState = 'incoming';
+
+  const fromName = data.fromName || peerName(data.from);
+  $('incomingName').textContent = fromName;
+  $('incomingAvatar').textContent = fromName.charAt(0).toUpperCase();
+  $('incomingType').textContent = callType === 'video' ? '邀请你视频通话' : '邀请你语音通话';
+  $('incomingView').classList.add('active');
+  logMsg(`收到来自 ${fromName} 的${callType === 'video' ? '视频' : '语音'}来电`);
+  playCallTone('incoming');
+}
+
+async function acceptCall() {
+  if (!callPeer) {
+    $('incomingView').classList.remove('active');
+    logMsg('来电已失效', 'warn');
+    return;
+  }
+  $('incomingView').classList.remove('active');
+  callState = 'connected';
+  showCallView();
+  stopCallTone();
+  logMsg(`接听 ${peerName(callPeer)} 的通话`, 'success');
+  sendMsg({ type: 'call_accept', data: { to: callPeer } });
+
+  try {
+    await publishMedia(callType);
+  } catch (e) {
+    logMsg('接听失败: ' + e.message, 'error');
+    endCall(true);
+    return;
+  }
+  startCallTimer();
+}
+
+function rejectCall() {
+  $('incomingView').classList.remove('active');
+  logMsg(`已拒接 ${peerName(callPeer)} 的来电`, 'warn');
+  stopCallTone();
+  playHangupTone();
+  sendMsg({ type: 'call_reject', data: { to: callPeer } });
+  // 重置状态时避免沿用残留的 PC 状态
+  callState = 'idle'; callPeer = ''; callType = '';
+}
+
+async function handleCallAccepted(data) {
+  if (callState !== 'calling') return;
+  callState = 'connected';
+  $('audioDesc').textContent = '通话中';
+  stopCallTone();
+  logMsg(`${peerName(callPeer)} 已接听`, 'success');
+  try {
+    await publishMedia(callType);
+  } catch (e) {
+    logMsg('发布媒体失败: ' + e.message, 'error');
+    endCall(true);
+    return;
+  }
+  startCallTimer();
+}
+
+function handleCallRejected(data) {
+  if (callState !== 'calling') return;
+  logMsg(`${peerName(callPeer)} 拒绝了通话`, 'warn');
+  toast('对方已拒绝');
+  stopCallTone();
+  playHangupTone();
+  hideCallView();
+  callState = 'idle'; callPeer = ''; callType = '';
+}
+
+function handleCallEnded(data) {
+  logMsg(`${peerName(callPeer)} 已挂断`, 'warn');
+  endCall(false);
+}
+
+// removeRemoteAudioEls 重置远端音频播放元素（避免多次通话累积音源）
+function removeRemoteAudioEls() {
+  const ra = $('remoteAudio');
+  if (ra) {
+    try { ra.pause(); } catch (e) {}
+    ra.srcObject = null;
+  }
+}
+
+function endCall(notify) {
+  const wasActive = callState !== 'idle';
+  if (notify) sendMsg({ type: 'call_end', data: { to: callPeer } });
+  stopCallTone();
+  stopCallTimer();
+  if (fakeTimer) { clearInterval(fakeTimer); fakeTimer = null; }
+  hideCallView();
+  $('incomingView').classList.remove('active');
+
+  if (localStream) { localStream.getTracks().forEach(t => t.stop()); localStream = null; }
+
+  // 移除发送轨道并重新协商（不关闭 PC，会话保持存活，可再次通话）
+  if (pc) {
+    let removed = 0;
+    pc.getSenders().forEach(s => {
+      if (s.track) { try { pc.removeTrack(s); removed++; } catch (e) {} }
+    });
+    if (removed > 0) setTimeout(() => makeOffer(), 120);
+  }
+
+  $('remoteVideo').srcObject = null;
+  $('localVideo').srcObject = null;
+  removeRemoteAudioEls();
+  autoPlayBlocked = false;
+  $('tapHint').classList.remove('show');
+
+  callState = 'idle'; callPeer = ''; callType = '';
+  isMuted = false; isCameraOn = true;
+  pendingSubscribes = [];
+  subscribedKeys.clear();
+  pendingReoffer = false;
+  pendingReofferIceRestart = false;
+  logMsg('通话已结束', 'warn');
+  if (wasActive) playHangupTone();
+}
+
+function startCallTimer() {
+  callStartTs = Date.now();
+  if (callTimerInt) clearInterval(callTimerInt);
+  callTimerInt = setInterval(() => {
+    $('callTimer').textContent = fmtTime(Math.floor((Date.now() - callStartTs) / 1000));
+  }, 1000);
+  $('callTimer').textContent = '00:00';
+}
+
+function stopCallTimer() {
+  if (callTimerInt) { clearInterval(callTimerInt); callTimerInt = null; }
+}
+
+// ============================================================
+// UI 控制
+// ============================================================
+function showCallView() {
+  const isVideo = callType === 'video';
+  const peerDisplay = peerName(callPeer);
+  $('callPeerName').textContent = peerDisplay;
+  $('callPeerAvatar').textContent = peerDisplay.charAt(0).toUpperCase();
+  $('audioAvatar').textContent = peerDisplay.charAt(0).toUpperCase();
+  $('audioName').textContent = peerDisplay;
+  $('audioStage').classList.toggle('active', !isVideo);
+  $('remoteVideo').style.display = isVideo ? '' : 'none';
+  $('cameraBtn').classList.toggle('hidden', !isVideo);
+  $('flipBtn').classList.toggle('hidden', !(isVideo && isMobileDevice()));
+  $('pip').style.display = isVideo ? '' : 'none';
+
+  isMuted = false; isCameraOn = true;
+  const mb = $('muteBtn');
+  mb.classList.remove('off');
+  setBtnIcon(mb, 'mic');
+  const cb = $('cameraBtn');
+  cb.classList.remove('off');
+  setBtnIcon(cb, 'videocam');
+  $('pip').classList.remove('off');
+
+  // 每次通话默认外放（扬声器），并同步按钮图标状态
+  speakerOn = true;
+  updateSpeakerBtn();
+  if (typeof HTMLMediaElement !== 'undefined' && 'setSinkId' in HTMLMediaElement.prototype) {
+    setAudioOutput('').catch(() => {});
+  }
+
+  closeDeviceSheet();
+  renderDeviceSelects();
+  $('callView').classList.add('active');
+}
+
+function hideCallView() {
+  $('callView').classList.remove('active');
+  closeDeviceSheet();
+  $('remoteVideo').srcObject = null;
+  $('localVideo').srcObject = null;
+  $('localVideo').style.transform = 'none';
+}
+
+function toggleMute() {
+  if (!localStream) return;
+  isMuted = !isMuted;
+  const t = localStream.getAudioTracks()[0];
+  if (t) t.enabled = !isMuted;
+  const btn = $('muteBtn');
+  btn.classList.toggle('off', isMuted);
+  setBtnIcon(btn, isMuted ? 'mic-off' : 'mic');
+  logMsg(isMuted ? '已静音' : '已取消静音');
+}
+
+function toggleCamera() {
+  if (!localStream) return;
+  isCameraOn = !isCameraOn;
+  const t = localStream.getVideoTracks()[0];
+  if (t) t.enabled = isCameraOn;
+  const btn = $('cameraBtn');
+  btn.classList.toggle('off', !isCameraOn);
+  setBtnIcon(btn, isCameraOn ? 'videocam' : 'videocam-off');
+  $('pip').classList.toggle('off', !isCameraOn);
+  logMsg(isCameraOn ? '摄像头已开启' : '摄像头已关闭');
+}
+
+function openDeviceSheet() {
+  $('sheetMask').classList.add('active');
+  $('deviceSheet').classList.add('active');
+  renderDeviceSelects();
+}
+
+function closeDeviceSheet() {
+  $('sheetMask').classList.remove('active');
+  $('deviceSheet').classList.remove('active');
+}
+
+// ============================================================
+// 联系人列表
+// ============================================================
+function renderContacts() {
+  const list = $('contactList');
+  $('contactCount').textContent = onlineUsers.size + ' 人';
+
+  if (onlineUsers.size === 0) {
+    list.innerHTML = `<div class="empty-tip">
+      <span data-icon="users" style="width:34px;height:34px;"></span>
+      <div>暂无其他在线用户<br>让对方用相同房间 ID 加入即可通话</div>
+    </div>`;
+    const ic = list.querySelector('[data-icon]');
+    if (ic) ic.innerHTML = ICONS.users;
+    return;
+  }
+
+  list.innerHTML = '';
+  onlineUsers.forEach((name, uid) => {
+    const display = name || uid;
+    const div = document.createElement('div');
+    div.className = 'contact';
+    div.innerHTML = `
+      <div class="avatar">${display.charAt(0).toUpperCase()}</div>
+      <div class="contact-body">
+        <div class="contact-name">${display}</div>
+        <div class="contact-status">在线</div>
+      </div>
+      <button class="icon-btn video" title="视频通话">${ICONS.videocam}</button>
+      <button class="icon-btn audio" title="语音通话">${ICONS.phone}</button>`;
+    div.querySelector('.icon-btn.video').addEventListener('click', () => startCall(uid, 'video'));
+    div.querySelector('.icon-btn.audio').addEventListener('click', () => startCall(uid, 'audio'));
+    list.appendChild(div);
+  });
+}
+
+// ============================================================
+// 统计面板
+// ============================================================
+let statsTimer = null;
+let lastBytes = 0;
+// 上一次采样到的本地上行字节数（用于计算实时上传码率）
+let lastUpBytes = 0;
+let lastStatsTs = Date.now();
+
+function startStats() {
+  if (statsTimer) clearInterval(statsTimer);
+  statsTimer = setInterval(async () => {
+    if (!pc) return;
+    try {
+      const stats = await pc.getStats();
+      // 建立 id -> report 的映射，便于通过候选对的 localCandidateId 反查本端候选类型
+      const reportMap = new Map();
+      stats.forEach(r => reportMap.set(r.id, r));
+
+      let recv = 0, lost = 0, jitter = 0, rtt = 0, bytes = 0;
+      // 本地上行（发送）字节数：统计 outbound-rtp，用于展示真实上传速率
+      let upBytes = 0;
+      // 当前正在使用的 ICE 候选对（用于判断走直连还是 TURN 中继）
+      let activePair = null;
+
+      stats.forEach(r => {
+        if (r.type === 'inbound-rtp') {
+          recv += r.packetsReceived || 0;
+          lost += r.packetsLost || 0;
+          jitter += (r.jitter || 0) * 1000;
+          bytes += r.bytesReceived || 0;
+        }
+        // 只统计真正在发送的轨道，避免把未发送的占位统计进来
+        if (r.type === 'outbound-rtp' && !r.isRemote) {
+          upBytes += r.bytesSent || 0;
+        }
+        if (r.type === 'candidate-pair' && r.state === 'succeeded') {
+          if (r.currentRoundTripTime) rtt = r.currentRoundTripTime * 1000;
+          // 优先取被选中（nominated / selected）的候选对，其次退化为任意可用候选对
+          if (r.nominated === true || r.selected === true || !activePair) activePair = r;
+        }
+      });
+
+      // 连接方式判定：查看被选中候选对的【本端】候选类型。
+      // host = 双方在同一内网直连；srflx/prflx = 经 NAT 打洞直连；relay = 走 TURN 中继转发。
+      let connType = '未知';
+      if (activePair) {
+        const local = reportMap.get(activePair.localCandidateId);
+        if (local) {
+          if (local.candidateType === 'relay') connType = 'TURN 中继';
+          else if (local.candidateType === 'host') connType = '直连(内网)';
+          else connType = '直连(打洞)';
+        }
+      }
+
+      const lossRate = (recv + lost) > 0 ? (lost / (recv + lost) * 100) : 0;
+      const now = Date.now();
+      const elapsed = (now - lastStatsTs) / 1000;
+      const bitrate = elapsed > 0 ? ((bytes - lastBytes) * 8 / elapsed / 1000) : 0;
+      // 上传码率 = 本次与上次上行字节之差换算成 kbps
+      const upBitrate = elapsed > 0 ? ((upBytes - lastUpBytes) * 8 / elapsed / 1000) : 0;
+      lastBytes = bytes;
+      lastUpBytes = upBytes;
+      lastStatsTs = now;
+
+      $('statRecv').textContent = recv;
+      $('statLost').textContent = lost;
+      $('statLoss').innerHTML = lossRate.toFixed(2) + '<small>%</small>';
+      $('statRtt').innerHTML = rtt.toFixed(0) + '<small>ms</small>';
+      $('statBitrate').innerHTML = Math.max(0, bitrate).toFixed(0) + '<small>kbps</small>';
+      $('statUpBitrate').innerHTML = Math.max(0, upBitrate).toFixed(0) + '<small>kbps</small>';
+      $('statJitter').innerHTML = jitter.toFixed(1) + '<small>ms</small>';
+
+      // 当前速率 = 接收码率 + 上传码率（实时合计带宽）
+      const totalRate = Math.max(0, bitrate) + Math.max(0, upBitrate);
+      const rateTxt = totalRate.toFixed(0);
+      $('statRate').innerHTML = rateTxt + '<small>kbps</small>';
+      $('callRate').textContent = rateTxt + ' kbps';
+
+      // 连接方式：直连 or TURN 中继（走中继时用橙色高亮，提醒已启用兜底）
+      $('statConnType').textContent = connType;
+      $('statConnType').style.color = connType === 'TURN 中继' ? '#fbbf24' : '';
+      $('callConnType').textContent = connType;
+      $('callConnType').style.color = connType === 'TURN 中继' ? '#fbbf24' : '';
+
+      // 通话中的网络质量指示
+      if (callState === 'connected') {
+        let level = '良好', cls = 'on';
+        if (lossRate > 8 || rtt > 400) { level = '较差'; cls = 'off'; }
+        else if (lossRate > 3 || rtt > 200) { level = '一般'; cls = ''; }
+        $('qualityText').textContent = level;
+        setDot('qualityDot', cls);
+      }
+    } catch (e) {}
+  }, 1000);
+}
+
+// ============================================================
+// 事件绑定
+// ============================================================
+$('connectBtn').addEventListener('click', connect);
+$('disconnectBtn').addEventListener('click', disconnect);
+$('acceptBtn').addEventListener('click', acceptCall);
+$('rejectBtn').addEventListener('click', rejectCall);
+$('hangupBtn').addEventListener('click', () => endCall(true));
+$('muteBtn').addEventListener('click', toggleMute);
+$('speakerBtn').addEventListener('click', toggleSpeaker);
+$('cameraBtn').addEventListener('click', toggleCamera);
+$('flipBtn').addEventListener('click', flipCamera);
+$('deviceBtn').addEventListener('click', openDeviceSheet);
+$('closeDeviceSheet').addEventListener('click', closeDeviceSheet);
+$('sheetMask').addEventListener('click', closeDeviceSheet);
+$('refreshDevicesBtn').addEventListener('click', () => { refreshDevices(); toast('设备列表已刷新'); });
+
+['cameraSelect', 'cameraSelectMain', 'cameraSelectCall'].forEach(id => {
+  const el = $(id);
+  if (el) el.addEventListener('change', e => onCameraSelect(e.target.value));
+});
+['micSelect', 'micSelectMain', 'micSelectCall'].forEach(id => {
+  const el = $(id);
+  if (el) el.addEventListener('change', e => onMicSelect(e.target.value));
+});
+
+// 点击本地画面可切换为全屏/小窗（移动端实用）
+$('pip').addEventListener('click', () => {
+  const pip = $('pip');
+  const small = pip.dataset.small !== '1';
+  pip.dataset.small = small ? '1' : '0';
+  pip.style.width = small ? '78px' : '132px';
+  pip.style.height = small ? '110px' : '186px';
+});
+
+// iOS：带声音的媒体需要用户手势才能播放，任意手势后尝试恢复
+function onUserGesture() {
+  getToneCtx();
+  resumeMediaPlayback();
+}
+document.addEventListener('touchstart', onUserGesture, true);
+document.addEventListener('click', onUserGesture, true);
+
+// 设备热插拔
+if (navigator.mediaDevices && navigator.mediaDevices.addEventListener) {
+  navigator.mediaDevices.addEventListener('devicechange', refreshDevices);
+}
+
+// 心跳
+setInterval(() => { if (ws && ws.readyState === WebSocket.OPEN) sendMsg({ type: 'ping' }); }, 15000);
+
+// 页面卸载时清理
+window.addEventListener('beforeunload', () => {
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    try { ws.close(); } catch (e) {}
+  }
+});
+
+// ============================================================
+// 初始化
+// ============================================================
+$('serverAddr').value = window.location.host;
+$('sessionId').value = 'user_' + Math.random().toString(36).substring(2, 6);
+logMsg('页面已加载，填写信息后点击连接');
+
+if (!window.isSecureContext) {
+  logMsg('警告：当前为非安全上下文(HTTP)，手机浏览器无法访问摄像头/麦克风，请改用 HTTPS 或 localhost', 'error');
+}
+
+renderContacts();
+startStats();
+refreshDevices();
+</script>
+</body>
+</html>
