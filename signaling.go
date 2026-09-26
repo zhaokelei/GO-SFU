@@ -26,6 +26,15 @@ type SignalingMessage struct {
 	Data interface{} `json:"data"` // 消息数据
 }
 
+// renegotiateDebounce 重协商请求的合并去抖窗口。
+//
+// 背景：用户加入房间后，前端会随即连续订阅多个轨道（他人视频/音频），
+// 每次订阅都会触发一轮完整的 Offer/Answer；一次入场可能叠加出 4~6 轮协商，
+// 既拉长首帧时间，也容易与浏览器自身的协商撞车（glare，日志中出现的
+// "have-local-offer" 冲突即源于此）。把短时间内的多次请求合并成一轮，
+// 可显著减少协商次数。
+const renegotiateDebounce = 300 * time.Millisecond
+
 // ClientInfo 客户端连接信息
 type ClientInfo struct {
 	conn       *websocket.Conn
@@ -38,6 +47,10 @@ type ClientInfo struct {
 	lastPong   time.Time
 	closed     bool
 	clientBusy int32 // 客户端是否正在协商（1=忙碌），用于避免双方同时发起 offer
+
+	// renegoMu / renegoTimer 重协商合并去抖（见 renegotiateDebounce 与 scheduleNegotiate）
+	renegoMu    sync.Mutex
+	renegoTimer *time.Timer
 
 	// pendingCandidates 暂存「远端描述尚未设置」时提前到达的 ICE 候选
 	// Trickle ICE 下浏览器可能在 Offer/Answer 处理完成前就发来候选，
@@ -103,7 +116,15 @@ func (c *ClientInfo) readLoop() {
 	for {
 		_, msg, err := c.conn.ReadMessage()
 		if err != nil {
-			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseNormalClosure) {
+			// 关闭码归类（修复日志误报）：
+			//   1000 正常关闭、1001 端点离开、1005 未携带关闭码（浏览器直接断开/切后台时常见）
+			// 以上都属于「对端正常收尾或环境导致」，只记 INFO；
+			// 其余（如 1006 异常断开、协议错误）才记 WARN，便于真正定位问题。
+			if websocket.IsUnexpectedCloseError(err,
+				websocket.CloseGoingAway,
+				websocket.CloseNormalClosure,
+				websocket.CloseNoStatusReceived,
+			) {
 				log.Warnf("[Signaling] WebSocket 读取异常 session=%s err=%v", c.sessionID, err)
 			} else {
 				log.Infof("[Signaling] WebSocket 连接关闭 session=%s", c.sessionID)
@@ -272,21 +293,7 @@ func (c *ClientInfo) handleJoin(data interface{}) {
 	// 返回房间内已有的其他 Session 列表（排除自己）
 	// 用于前端展示在线联系人，保证后加入者也能看到先加入者
 	// 每项包含唯一 sessionId（拨号用）与显示昵称 name（展示用）
-	others := make([]map[string]string, 0)
-	for _, s := range room.GetAllSessions() {
-		if s.ID != sessionID {
-			others = append(others, map[string]string{
-				"sessionId": s.ID,
-				"name":      s.Name,
-			})
-		}
-	}
-	c.sendMessage(SignalingMessage{
-		Type: "sessions_list",
-		Data: map[string]interface{}{
-			"sessions": others,
-		},
-	})
+	c.sendMessage(room.buildSessionsListMsg(sessionID))
 }
 
 // handleOffer 处理浏览器发来的 Offer SDP
@@ -560,9 +567,10 @@ func (c *ClientInfo) handleSubscribe(data interface{}) {
 		return
 	}
 
-	// 订阅成功后，需要服务器发起重协商（发送 Offer）
-	// 因为 AddTrack 会触发 negotiationneeded
-	c.negotiate()
+	// 订阅成功后需要服务器发起重协商（发送 Offer），因为 AddTrack 会触发 negotiationneeded。
+	// 采用「合并去抖」而非立即协商：入场时前端会连续订阅多个轨道，
+	// 合并后可把多轮 Offer/Answer 压成一轮，缩短首帧时间并减少 glare
+	c.scheduleNegotiate()
 
 	log.Infof("[Signaling] Session %s 订阅成功 publisher=%s track=%s",
 		c.sessionID, publisherID, trackID)
@@ -591,8 +599,8 @@ func (c *ClientInfo) handleUnsubscribe(data interface{}) {
 
 	room.UnsubscribeTrack(c.sessionID, publisherID, trackID)
 
-	// 取消订阅后重协商
-	c.negotiate()
+	// 取消订阅后重协商（同样走合并去抖，与并发到达的其它订阅/取消请求合并为一次）
+	c.scheduleNegotiate()
 }
 
 // handleListTracks 获取房间内所有轨道
@@ -622,6 +630,29 @@ func (c *ClientInfo) handleListTracks() {
 // 异步执行 + 串行化，避免同一个 PC 上并发发起多次 offer 导致协商冲突
 func (c *ClientInfo) negotiate() {
 	go c.negotiateAsync(false)
+}
+
+// scheduleNegotiate 合并短时间内的多次重协商请求（去抖）。
+//
+// 与 negotiate 的区别：本函数不会立即发起 Offer，而是在 renegotiateDebounce
+// 窗口内把多次请求合并为一次（窗口内已有待触发定时器时直接返回）。
+// 典型场景：加入房间后前端连续订阅多个轨道，若每次订阅都立刻协商，
+// 会叠加出多轮 Offer/Answer 并与浏览器协商撞车。合并后只发起一轮，
+// 既缩短首帧时间，也降低 glare 概率。
+func (c *ClientInfo) scheduleNegotiate() {
+	c.renegoMu.Lock()
+	if c.renegoTimer != nil {
+		// 已有待触发的合并定时器：本次请求并入其中
+		c.renegoMu.Unlock()
+		return
+	}
+	c.renegoTimer = time.AfterFunc(renegotiateDebounce, func() {
+		c.renegoMu.Lock()
+		c.renegoTimer = nil
+		c.renegoMu.Unlock()
+		c.negotiate()
+	})
+	c.renegoMu.Unlock()
 }
 
 // negotiateICERestart 服务器发起 ICE 重启重协商
@@ -851,6 +882,14 @@ func (c *ClientInfo) cleanup() {
 	}
 	c.closed = true
 	c.mu.Unlock()
+
+	// 停止待触发的重协商合并定时器，避免连接已关闭后仍发起无意义的协商
+	c.renegoMu.Lock()
+	if c.renegoTimer != nil {
+		c.renegoTimer.Stop()
+		c.renegoTimer = nil
+	}
+	c.renegoMu.Unlock()
 
 	// 从客户端映射中移除
 	// 仅当映射中登记的仍然是本连接时才删除，

@@ -46,12 +46,27 @@ const (
 
 	// ICE disconnected 宽限期：disconnected 在弱网下常可自愈，
 	// 宽限期内恢复为 connected/completed 则取消关闭，避免误杀正常连接
-	iceDisconnectGrace = 15 * time.Second
+	iceDisconnectGrace = 20 * time.Second
 
 	// ICE 断开后服务端兜底发起 ICE 重启的延时。
-	// 前端在检测到断开时也会自行 restartIce，此处留出时间让前端先尝试恢复；
-	// 若宽限期内仍然后端断开，才由服务端兜底发起一次 ICE 重启重协商。
-	iceRestartFallbackDelay = 6 * time.Second
+	//
+	// 【关键修复】前端检测到 disconnected 后会先经过一段自愈观察期（约 4 秒）
+	// 再发起自己的 ICE 重启，并带指数退避；因此服务端兜底必须明显往后顺延，
+	// 绝不能在前端重协商尚未完成时就抢先重启。
+	// 之前该值为 6 秒，恰好与前端的重启时刻重叠：前端刚 restartIce，服务端又
+	// 兜底重启，两端各自生成一套新的 ICE 凭据并各自重协商，状态互相搅乱，
+	// 表现为「拨打几秒就卡死」。这里拉长到 12 秒，只有当前端侧恢复彻底失败时，
+	// 服务端才介入兜底。
+	iceRestartFallbackDelay = 12 * time.Second
+
+	// pliMinInterval 向发布者透传 PLI（关键帧请求）的最小间隔。
+	//
+	// 背景：日志中出现大量「订阅者请求 PLI」在极短时间内重复触发。原因是
+	// PLI 由浏览器在画面无法解码时自动周期性发送，若多个订阅者同时卡顿，
+	// 会向同一个发布者叠加出高频 PLI 风暴，既浪费上行带宽，也会让发布者
+	// 频繁强制编码关键帧，反而进一步加剧拥塞，形成恶性循环。
+	// 这里按「发布者轨道」维度做节流：窗口内只透传一次，多个订阅者的请求合并。
+	pliMinInterval = 500 * time.Millisecond
 )
 
 // SessionInfo 会话信息（通知前端用）
@@ -83,6 +98,7 @@ type PublishedTrack struct {
 	buffer      *RTPBuffer             // RTP 滑动窗口缓存（NACK 用）
 	validator   *SeqValidator          // 序列号校验器
 	nackLimiter *NackMissLimiter       // NACK 未命中限流器（防止 NACK 风暴）
+	lastPLIAt   time.Time              // 上一次向发布者透传 PLI 的时间（PLI 节流用）
 	mu          sync.RWMutex
 	subscribers map[string]*subscriberInfo // 订阅该轨道的 Session
 	closed      bool
@@ -129,6 +145,12 @@ type Session struct {
 
 	once   sync.Once
 	closed bool
+
+	// iceCheckPending 标记「ICE checking 超时告警」协程是否已在运行，用于去重。
+	// 弱网或反复重协商时 ICE 会在 checking/connected 之间来回切换，若每次进入
+	// checking 都新起一个 15 秒计时协程，就会堆积出大量协程，并在超时后集中
+	// 打印「ICE 候选收集超时(15s)」告警刷屏。用该标志保证同一时刻只有一个。
+	iceCheckPending atomic.Bool
 }
 
 // SubscriptionInfo 订阅信息（本 Session 订阅其他发布者的轨道）
@@ -271,17 +293,23 @@ func (s *Session) registerHandlers() {
 			}()
 		}
 
-		// ICE 长时间收集不到候选，输出警告
+		// ICE 长时间收集不到候选，输出警告。
+		// 注意：ICE 会在 checking/connected 之间反复切换，若每次进入 checking
+		// 都新起一个计时协程，就会堆积出大量协程，并在超时后集中打印告警刷屏。
+		// 这里用 iceCheckPending 去重，保证同一时刻只有一个计时协程在运行。
 		if state == webrtc.ICEConnectionStateChecking {
-			go func() {
-				select {
-				case <-time.After(15 * time.Second):
-					if s.pc.ICEConnectionState() == webrtc.ICEConnectionStateChecking {
-						log.Warnf("[Session %s] ICE 候选收集超时(15s)，可能存在网络问题", s.ID)
+			if s.iceCheckPending.CompareAndSwap(false, true) {
+				go func() {
+					defer s.iceCheckPending.Store(false)
+					select {
+					case <-time.After(15 * time.Second):
+						if s.pc.ICEConnectionState() == webrtc.ICEConnectionStateChecking {
+							log.Warnf("[Session %s] ICE 候选收集超时(15s)，可能存在网络问题", s.ID)
+						}
+					case <-s.ctx.Done():
 					}
-				case <-s.ctx.Done():
-				}
-			}()
+				}()
+			}
 		}
 	})
 
@@ -666,6 +694,17 @@ func (s *Session) readSubscriberRTCPLoop(pub *PublishedTrack, localTrack *webrtc
 		default:
 		}
 
+		// 订阅关系已不存在（用户取消订阅、挂断或会话关闭）时立即退出本循环。
+		// 否则 RemoveTrack 之后 ReadRTCP 会持续返回错误、陷入 10ms 空转，
+		// 白白占用一个 goroutine 与 CPU。
+		pub.mu.RLock()
+		_, stillSubscribed := pub.subscribers[s.ID]
+		pubClosed := pub.closed
+		pub.mu.RUnlock()
+		if !stillSubscribed || pubClosed {
+			return
+		}
+
 		pkts, _, err := sender.ReadRTCP()
 		if err != nil {
 			if errors.Is(err, io.EOF) {
@@ -683,7 +722,18 @@ func (s *Session) readSubscriberRTCPLoop(pub *PublishedTrack, localTrack *webrtc
 		for _, pkt := range pkts {
 			switch p := pkt.(type) {
 			case *rtcp.PictureLossIndication:
-				// 订阅者请求关键帧，透传给发布者
+				// 订阅者请求关键帧，透传给发布者。
+				// 按发布者轨道维度做节流：pliMinInterval 内的重复请求直接丢弃，
+				// 避免多个订阅者同时卡顿时叠加出 PLI 风暴（见 pliMinInterval 注释）。
+				now := time.Now()
+				pub.mu.Lock()
+				if !pub.lastPLIAt.IsZero() && now.Sub(pub.lastPLIAt) < pliMinInterval {
+					pub.mu.Unlock()
+					break
+				}
+				pub.lastPLIAt = now
+				pub.mu.Unlock()
+
 				log.Infof("[Session %s] 订阅者请求 PLI，透传给发布者轨道 %s", s.ID, pub.trackID)
 				// 通过发布者的 PeerConnection 发送 PLI 给发布者浏览器
 				if err := pub.publisherPC.WriteRTCP([]rtcp.Packet{

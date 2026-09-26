@@ -24,6 +24,11 @@ type RoomConfig struct {
 	JitterBufferMs int // 抖动缓冲时间（毫秒）
 }
 
+// emptyRoomGrace 空房销毁宽限期。
+// 用于跨越「断线重连/顶替旧连接」造成的极短空房瞬间，
+// 避免房间被反复销毁后再重建。
+const emptyRoomGrace = 3 * time.Second
+
 // RoomEvent 房间事件（用于有序分发队列）
 type RoomEvent struct {
 	Type      SessionEvent // 事件类型
@@ -42,6 +47,13 @@ type Room struct {
 	stopCh     chan struct{}   // 停止信号
 
 	destroyOnce sync.Once // 保证房间只销毁一次
+
+	// destroyTimer 空房延迟销毁定时器。
+	// 断线重连/顶替旧连接时，服务端会先移除旧 Session 再加入新 Session，
+	// 中间存在极短的空房瞬间（实测日志里出现过仅 423ms 的空房）。
+	// 若一空就立刻销毁，会出现「销毁 → 立即重建」的抖动，事件循环与统计采样被反复重启。
+	// 引入宽限期后可跨越这个瞬间，只在真正长时间无人时才销毁。
+	destroyTimer *time.Timer
 
 	// 统计
 	createdAt      time.Time
@@ -123,6 +135,11 @@ func (r *Room) notifySession(s *Session, event *RoomEvent) {
 			},
 		}
 		sendToClient(s.ID, msg)
+		// 关键兜底：紧接着再向该客户端下发一份「房间内除自己外的完整成员列表」。
+		// 增量事件一旦出现时序错乱、消息丢失，就会导致某些客户端漏显成员
+		// （典型现象：后加入的人看不到先加入的人，或在安卓端不显示）。
+		// 全量列表是权威数据，前端收到后整体覆盖，可彻底消除这类不一致。
+		sendToClient(s.ID, r.buildSessionsListMsg(s.ID))
 
 	case EventSessionLeave:
 		// 离开事件携带 name（由移除方在删除前取出）
@@ -135,6 +152,8 @@ func (r *Room) notifySession(s *Session, event *RoomEvent) {
 			},
 		}
 		sendToClient(s.ID, msg)
+		// 同上：有人离开后也下发一次全量列表兜底，保证列表与服务器状态一致
+		sendToClient(s.ID, r.buildSessionsListMsg(s.ID))
 
 	case EventTrackPublished:
 		trackInfo, _ := event.Data.(TrackInfo)
@@ -202,6 +221,14 @@ func (r *Room) AddSession(session *Session) error {
 
 	session.room = r
 	r.sessions[session.ID] = session
+
+	// 有 Session 加入：取消可能存在的空房销毁倒计时，
+	// 避免「刚加入就被上一轮倒计时销毁」的竞态
+	if r.destroyTimer != nil {
+		r.destroyTimer.Stop()
+		r.destroyTimer = nil
+	}
+
 	log.Infof("[Room %s] Session %s 加入，当前在线 %d 人",
 		r.ID, session.ID, len(r.sessions))
 
@@ -264,15 +291,43 @@ func (r *Room) removeSession(sessionID string, only *Session) {
 	r.checkAndDestroyIfEmpty()
 }
 
-// checkAndDestroyIfEmpty 如果房间没有 Session，销毁房间
+// checkAndDestroyIfEmpty 房间为空时「延迟销毁」。
+//
+// 为什么不立即销毁：断线重连或顶替旧连接时，服务端会先移除旧 Session
+// 再加入新 Session，中间存在极短的空房瞬间。若一空就立刻销毁，
+// 会造成房间被反复销毁/重建（日志中可见 423ms 的极短生命周期）。
+// 这里给出空房宽限期：宽限期内只要有 Session 加入即取消销毁；
+// 到期仍为空才真正移除房间。
 func (r *Room) checkAndDestroyIfEmpty() {
-	r.mu.RLock()
-	empty := len(r.sessions) == 0
-	r.mu.RUnlock()
+	r.mu.Lock()
 
-	if empty {
-		roomManager.RemoveRoom(r.ID)
+	if len(r.sessions) > 0 {
+		// 已有人：撤销待执行的销毁倒计时
+		if r.destroyTimer != nil {
+			r.destroyTimer.Stop()
+			r.destroyTimer = nil
+		}
+		r.mu.Unlock()
+		return
 	}
+
+	if r.destroyTimer != nil {
+		// 已有销毁倒计时在跑，无需重复启动
+		r.mu.Unlock()
+		return
+	}
+
+	r.destroyTimer = time.AfterFunc(emptyRoomGrace, func() {
+		r.mu.Lock()
+		stillEmpty := len(r.sessions) == 0
+		r.destroyTimer = nil
+		r.mu.Unlock()
+
+		if stillEmpty {
+			roomManager.RemoveRoom(r.ID)
+		}
+	})
+	r.mu.Unlock()
 }
 
 // GetSession 获取房间内的 Session
@@ -302,6 +357,29 @@ func (r *Room) GetAllSessions() []*Session {
 		sessions = append(sessions, s)
 	}
 	return sessions
+}
+
+// buildSessionsListMsg 构造「房间内除 exceptID 之外所有成员」的完整列表消息。
+// 每项包含唯一 sessionId（信令寻址/拨号用）与显示昵称 name（界面展示用）。
+// 这是在线联系人列表的权威数据来源：客户端收到后整体覆盖本地列表即可，
+// 从而不依赖任何增量事件的到达顺序，彻底避免漏显成员的问题。
+func (r *Room) buildSessionsListMsg(exceptID string) SignalingMessage {
+	others := make([]map[string]string, 0)
+	for _, s := range r.GetAllSessions() {
+		if s == nil || s.ID == exceptID {
+			continue
+		}
+		others = append(others, map[string]string{
+			"sessionId": s.ID,
+			"name":      s.Name,
+		})
+	}
+	return SignalingMessage{
+		Type: "sessions_list",
+		Data: map[string]interface{}{
+			"sessions": others,
+		},
+	}
 }
 
 // SessionCount 获取房间内 Session 数量
@@ -419,6 +497,14 @@ func (r *Room) Destroy() {
 	// 保证只销毁一次，避免重复 close(stopCh) 导致 panic
 	r.destroyOnce.Do(func() {
 		log.Infof("[Room %s] 销毁房间", r.ID)
+
+		// 停掉可能存在的空房销毁倒计时，避免定时器在销毁后再触发
+		r.mu.Lock()
+		if r.destroyTimer != nil {
+			r.destroyTimer.Stop()
+			r.destroyTimer = nil
+		}
+		r.mu.Unlock()
 
 		// 停止事件循环
 		close(r.stopCh)

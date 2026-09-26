@@ -598,6 +598,12 @@ window.__YSP_TURN__ = __YSP_TURN_CONFIG_PLACEHOLDER__;
         <span data-icon="login" style="width:17px;height:17px;"></span>连接
       </button>
     </div>
+
+    <!-- 前端版本号：用于快速确认本机（尤其是安卓/手机）加载的是否为最新页面。
+         若不同设备显示不一致，说明该设备仍在用缓存的旧页面，需要清缓存后重进。 -->
+    <div style="margin-top:14px; text-align:center; font-size:12px; color:#5b6b85; letter-spacing:0.4px;">
+      前端版本 2026.09.26.5
+    </div>
   </div>
 </div>
 
@@ -859,6 +865,13 @@ let pendingReofferIceRestart = false;
 // 这里记录重启尝试次数与定时器，用于带退避地自动重启 ICE 并重协商。
 let iceRestartAttempts = 0;
 let iceRestartTimer = null;
+// disconnected 是"可能自愈"的临时状态：通话建立初期的多轮重协商（互相订阅轨道）
+// 或网络抖动都会让它短暂出现，通常几百毫秒内就自行恢复。若不加以观察就立刻
+// restartIce，反而会主动打断正在恢复的连接，并连带触发服务端兜底 ICE 重启，
+// 两端互相搅乱后彻底连不上——这正是"拨打几秒就卡死"的直接原因。
+// 因此这里先给一段观察期，只有持续断开才真正重启 ICE。
+let iceDisconnectedTimer = null;
+const ICE_DISCONNECT_GRACE = 4000;  // disconnected 自愈观察期（毫秒）
 const ICE_RESTART_MAX_ATTEMPTS = 4; // 单次断线内最多尝试 4 次
 
 // 在线用户：sessionId(唯一连接 ID) -> name(显示昵称)
@@ -1062,10 +1075,11 @@ async function makeOffer(iceRestart) {
 function resetIceRestartState() {
   iceRestartAttempts = 0;
   if (iceRestartTimer) { clearTimeout(iceRestartTimer); iceRestartTimer = null; }
+  if (iceDisconnectedTimer) { clearTimeout(iceDisconnectedTimer); iceDisconnectedTimer = null; }
 }
 
 // scheduleIceRestart ICE 断开时的主动恢复流程
-// 背景：disconnected/failed 意味着连通性检查已失败（弱网丢包、NAT 端口映射变化等）。
+// 背景：failed 意味着连通性检查已确定失败（NAT 端口映射变化等）。
 // 仅靠自己"等"往往无法恢复，必须主动 restartIce 并重协商，让两端重新交换
 // ICE 凭据与候选。这里带退避重试，若期间恢复为 connected 会被重置。
 function scheduleIceRestart(reason) {
@@ -1076,10 +1090,11 @@ function scheduleIceRestart(reason) {
   iceRestartAttempts++;
   logMsg(`ICE 异常(${reason})，发起第 ${iceRestartAttempts} 次 ICE 重启`, 'warn');
 
-  // 标记后续 createOffer 生成 ICE 重启 Offer（标准 API，部分旧浏览器不支持则忽略）
-  try { if (typeof pc.restartIce === 'function') pc.restartIce(); } catch (e) {}
-
-  // 退避后执行重协商；若本地正忙则再排一轮
+  // 退避后执行重协商；若本地正忙则改为排队，等信令回到 stable 后统一补发。
+  // 关键：这里绝不能再递归调用 scheduleIceRestart —— 过去每次递归都会重新
+  // 叠加一次退避时间（500+1000+1500+2000≈5 秒），导致 ICE 重启 Offer 被推迟到
+  // 6 秒后才发出。这段时间里浏览器已 restartIce、服务端又被动重启 ICE，
+  // 两端状态严重不同步，原本可自愈的连接被彻底打断，表现为"拨打几秒就卡死"。
   const delay = Math.min(500 * iceRestartAttempts, 2000);
   iceRestartTimer = setTimeout(() => {
     iceRestartTimer = null;
@@ -1087,9 +1102,13 @@ function scheduleIceRestart(reason) {
     const st = pc.iceConnectionState;
     if (st === 'connected' || st === 'completed') return; // 已自行恢复
     if (pc.signalingState === 'stable') {
+      // 标记后续 createOffer 生成 ICE 重启 Offer（标准 API，旧浏览器不支持则忽略）
+      try { if (typeof pc.restartIce === 'function') pc.restartIce(); } catch (e) {}
       makeOffer(true);
     } else {
-      scheduleIceRestart('本地协商中');
+      // 本地正在协商：排队，交由 signalingstatechange 回到 stable 后补发，不再层层延后
+      pendingReoffer = true;
+      pendingReofferIceRestart = true;
     }
   }, delay);
 }
@@ -1162,34 +1181,49 @@ function handleServerMsg(msg) {
       break;
 
     case 'sessions_list': {
+      // 服务端下发的「房间内除自己外的完整成员列表」是权威数据。
+      // 这里整体覆盖本地列表，不依赖 session_join / session_leave 的到达顺序，
+      // 从根本上避免「后加入者看不到先加入者」或个别端漏显成员的问题。
       const list = msg.data.sessions || [];
+      const next = new Map();
       list.forEach(u => {
         if (u && u.sessionId && u.sessionId !== sessionId) {
-          onlineUsers.set(u.sessionId, u.name || u.sessionId);
+          next.set(u.sessionId, u.name || u.sessionId);
         }
       });
+
+      // 与本地旧列表对比，产生上线/下线提示
+      const added = [];
+      next.forEach((name, uid) => { if (!onlineUsers.has(uid)) added.push(uid); });
+      const removed = [];
+      onlineUsers.forEach((name, uid) => { if (!next.has(uid)) removed.push([uid, name]); });
+
+      onlineUsers.clear();
+      next.forEach((name, uid) => onlineUsers.set(uid, name));
       renderContacts();
-      if (list.length > 0) logMsg(`房间内已有 ${list.length} 位用户`);
+
+      added.forEach(uid => logMsg(`用户 ${peerName(uid)} 上线`));
+      removed.forEach(([uid, name]) => {
+        logMsg(`用户 ${name || uid} 下线`, 'warn');
+        if (callPeer === uid && callState !== 'idle') {
+          logMsg('通话对方已下线', 'warn');
+          endCall(false);
+        }
+      });
       break;
     }
 
     case 'session_join':
+      // 增量事件仅作兜底：服务端随后会紧跟一条全量 sessions_list 覆盖本地列表
       if (msg.data.sessionId !== sessionId) {
         onlineUsers.set(msg.data.sessionId, msg.data.name || msg.data.sessionId);
         renderContacts();
-        logMsg(`用户 ${peerName(msg.data.sessionId)} 上线`);
       }
       break;
 
     case 'session_leave': {
-      const leaveName = peerName(msg.data.sessionId);
       onlineUsers.delete(msg.data.sessionId);
       renderContacts();
-      logMsg(`用户 ${leaveName} 下线`, 'warn');
-      if (callPeer === msg.data.sessionId && callState !== 'idle') {
-        logMsg('通话对方已下线', 'warn');
-        endCall(false);
-      }
       break;
     }
 
@@ -1282,12 +1316,24 @@ function initPC() {
     if (callState !== 'idle') logMsg('ICE: ' + st, on ? 'success' : 'info');
 
     if (on) {
-      // 已连通：清空 ICE 重启计数，允许下次断线重新触发恢复
+      // 已连通：清空 ICE 重启计数与观察计时器，允许下次断线重新触发恢复
       resetIceRestartState();
-    } else if (callState !== 'idle' && (st === 'disconnected' || st === 'failed')) {
-      // 断开/失败：主动重启 ICE 并重协商，避免一直停在 disconnected
-      // 直到服务端 15s 宽限期超时关闭会话
-      scheduleIceRestart(st);
+    } else if (callState !== 'idle' && st === 'failed') {
+      // failed 已确定不可恢复（如端口映射失效 / 打洞彻底失败），立即重启 ICE
+      scheduleIceRestart('failed');
+    } else if (callState !== 'idle' && st === 'disconnected') {
+      // disconnected 是"可能自愈"的临时状态：通话建立初期的多轮重协商（互相订阅轨道）
+      // 或网络抖动极易让它短暂出现，通常几百毫秒就自行恢复。若此时立刻 restartIce，
+      // 会主动打断正在恢复的连接，并连带触发服务端兜底 ICE 重启，两端互相搅乱后
+      // 彻底连不上。这里先观察一段时间，只有持续断开才真正重启 ICE。
+      if (!iceDisconnectedTimer) {
+        iceDisconnectedTimer = setTimeout(() => {
+          iceDisconnectedTimer = null;
+          if (!pc) return;
+          const cur = pc.iceConnectionState;
+          if (cur === 'disconnected' || cur === 'failed') scheduleIceRestart('disconnected');
+        }, ICE_DISCONNECT_GRACE);
+      }
     }
   };
 
@@ -1637,6 +1683,34 @@ function createFakeStream(type) {
   return stream;
 }
 
+// applyVideoCodecPreference 固定视频编码优先级（VP8 → H264 → VP9）。
+// 背景：日志中同一通话里视频载荷类型在 pt=96/pt=98 之间漂移，说明不同浏览器
+// 各自按默认偏好挑编码，导致服务端 SSRC/PT 映射不稳定。显式指定优先级后：
+//   - 支持 VP8 的端（安卓 / 桌面 Chrome）统一走 VP8；
+//   - 仅支持 H264 的端（部分 iOS / Safari）自动落到 H264；
+// 编码与 PT 选择从此稳定可预期，最后追加其余编码（如 AV1）以保证兼容性不下降。
+function applyVideoCodecPreference(transceiver) {
+  if (!transceiver || typeof transceiver.setCodecPreferences !== 'function') return;
+  if (typeof RTCRtpSender === 'undefined' || typeof RTCRtpSender.getCapabilities !== 'function') return;
+  try {
+    const caps = RTCRtpSender.getCapabilities('video');
+    if (!caps || !caps.codecs) return;
+    const order = ['video/VP8', 'video/H264', 'video/VP9'];
+    const ordered = [];
+    for (const mime of order) {
+      for (const c of caps.codecs) {
+        if (c.mimeType === mime && !ordered.includes(c)) ordered.push(c);
+      }
+    }
+    for (const c of caps.codecs) {
+      if (!ordered.includes(c)) ordered.push(c);
+    }
+    transceiver.setCodecPreferences(ordered);
+  } catch (e) {
+    // 设置失败不致命，保持浏览器默认偏好即可
+  }
+}
+
 // tuneSenders 设置发送参数
 // 关键点：
 //   1) 视频码率上限 2.5 Mbps + 30fps，配合 1080p 采集，好网络下画面清晰；
@@ -1705,7 +1779,28 @@ async function publishMedia(type) {
       usingFakeMedia = true;
     }
 
-    localStream.getTracks().forEach(t => pc.addTrack(t, localStream));
+    // 关键修复：显式用 addTransceiver 指定「单路发送编码」，从源头避免浏览器
+    // 为该轨道额外生成多路 Simulcast SSRC。多路 SSRC 依赖服务端正确解析
+    // mid/rid 头扩展，历史日志中因服务端缺该扩展，大量 RTP 包被判为
+    // "unhandled ssrc" 丢弃（连接正常却没有画面）。这里只声明一路编码，
+    // 并顺带固定码率上限；视频再套用编码优先级，避免 PT 在 96/98 间漂移。
+    for (const t of localStream.getTracks()) {
+      const enc = t.kind === 'video'
+        ? { maxBitrate: VIDEO_MAX_BITRATE, maxFramerate: 30 }
+        : { maxBitrate: 96000 };
+      try {
+        const transceiver = pc.addTransceiver(t, {
+          direction: 'sendrecv',
+          streams: [localStream],
+          sendEncodings: [enc]
+        });
+        if (t.kind === 'video') applyVideoCodecPreference(transceiver);
+      } catch (e) {
+        // 个别旧浏览器不支持 sendEncodings，回退到最基础的 addTrack
+        logMsg('addTransceiver(sendEncodings) 不受支持，回退 addTrack: ' + e.message, 'warn');
+        pc.addTrack(t, localStream);
+      }
+    }
     await tuneSenders();
     refreshLocalPreview();
 
@@ -2123,6 +2218,7 @@ function endCall(notify) {
   subscribedKeys.clear();
   pendingReoffer = false;
   pendingReofferIceRestart = false;
+  resetIceRestartState(); // 清理 ICE 重启计数与 disconnected 观察计时器
   logMsg('通话已结束', 'warn');
   if (wasActive) playHangupTone();
 }

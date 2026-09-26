@@ -28,6 +28,7 @@ import (
 
 	"github.com/pion/interceptor"
 	"github.com/pion/logging"
+	"github.com/pion/sdp/v3"
 	"github.com/pion/turn/v2"
 	"github.com/pion/webrtc/v3"
 )
@@ -38,19 +39,20 @@ import (
 
 // 命令行参数
 var (
-	addr           = flag.String("addr", ":2033", "监听地址")
-	publicIP       = flag.String("public-ip", "", "服务器公网IP（必填）")
-	stunURL        = flag.String("stun", "stun:stun.chat.bilibili.com:3478,stun:stun.cloudflare.com:3478,stun:stun.miwifi.com:3478", "客户端STUN地址（多个用逗号分隔，仅下发给前端；服务端自身已不再使用）")
-	turnURL        = flag.String("turn-url", "", "外部 TURN 地址（可选，仅供服务端自身使用）")
-	turnUser       = flag.String("turn-user", "ysp", "TURN 用户名（内嵌 TURN 与外部 TURN 共用）")
-	turnPass       = flag.String("turn-pass", "", "TURN 密码（内嵌 TURN：留空则每次启动随机生成；外部 TURN：需显式填写）")
-	turnPort       = flag.Int("turn-port", 3478, "内嵌 TURN 服务监听端口(UDP)，设为 0 表示禁用内嵌 TURN")
-	turnRealm      = flag.String("turn-realm", "ysp-sfu", "内嵌 TURN 认证域(realm)")
-	jitterBufferMs = flag.Int("jitter-buffer-ms", 50, "抖动缓冲时间(ms)")
-	nackCacheSize  = flag.Int("nack-cache-size", 1024, "NACK缓存包数量")
-	maxSessions    = flag.Int("max-sessions", 100, "单个房间最大Session数")
-	logLevel       = flag.String("log-level", "INFO", "日志级别(INFO/WARN/ERROR)")
-	logFile        = flag.String("log-file", "sfu.log", "日志文件路径（为空则只输出到控制台）")
+	addr             = flag.String("addr", ":2033", "监听地址")
+	publicIP         = flag.String("public-ip", "", "服务器公网IP（必填）")
+	stunURL          = flag.String("stun", "stun:stun.chat.bilibili.com:3478,stun:stun.cloudflare.com:3478,stun:stun.miwifi.com:3478", "客户端STUN地址（多个用逗号分隔，仅下发给前端；服务端自身已不再使用）")
+	turnURL          = flag.String("turn-url", "", "外部 TURN 地址（可选，仅供服务端自身使用）")
+	turnUser         = flag.String("turn-user", "ysp", "TURN 用户名（内嵌 TURN 与外部 TURN 共用）")
+	turnPass         = flag.String("turn-pass", "", "TURN 密码（内嵌 TURN：留空则从 turn_credential.json 读取，不存在则生成并持久化；外部 TURN：需显式填写）")
+	turnPort         = flag.Int("turn-port", 3478, "内嵌 TURN 服务监听端口(UDP)，设为 0 表示禁用内嵌 TURN")
+	turnRealm        = flag.String("turn-realm", "ysp-sfu", "内嵌 TURN 认证域(realm)")
+	filterPrivateICE = flag.Bool("filter-private-ice", false, "是否过滤内网私有地址 ICE 候选（默认 false：保留内网候选，以支持同一 WiFi 下的直连）")
+	jitterBufferMs   = flag.Int("jitter-buffer-ms", 50, "抖动缓冲时间(ms)")
+	nackCacheSize    = flag.Int("nack-cache-size", 1024, "NACK缓存包数量")
+	maxSessions      = flag.Int("max-sessions", 100, "单个房间最大Session数")
+	logLevel         = flag.String("log-level", "INFO", "日志级别(INFO/WARN/ERROR)")
+	logFile          = flag.String("log-file", "sfu.log", "日志文件路径（为空则只输出到控制台）")
 )
 
 // webrtcAPI 全局 WebRTC API 实例
@@ -108,10 +110,63 @@ func initWebRTC(pubIP string) (*webrtc.API, error) {
 	// 这里放宽为：断连 10s、失败 30s、保活 2s，给网络抖动留出恢复余量。
 	settingEngine.SetICETimeouts(10*time.Second, 30*time.Second, 2*time.Second)
 
+	// 可选：过滤内网私有地址 ICE 候选（任务：日志中 172.18.x.x 等内网候选被下发）。
+	//
+	// 默认【不开启】。因为保留内网 host 候选正是「同一 WiFi 下两台手机直连服务器」
+	// 能成功的关键（绕开家用路由器普遍不支持的 NAT 回流）。若部署环境不需要内网直连
+	// （例如纯公网云主机、只走公网/中继），可加 --filter-private-ice 把私有、回环、
+	// 链路本地候选全部剔除，减少无效候选与连通性探测开销。
+	if *filterPrivateICE {
+		settingEngine.SetIPFilter(func(ip net.IP) bool {
+			if ip == nil {
+				return false
+			}
+			return !isPrivateIP(ip)
+		})
+		log.Infof("已启用 ICE 候选过滤：丢弃内网私有地址候选")
+	}
+
 	// 创建媒体引擎，注册常用编解码器
 	mediaEngine := webrtc.MediaEngine{}
 	if err := mediaEngine.RegisterDefaultCodecs(); err != nil {
 		return nil, fmt.Errorf("注册默认编解码器失败: %w", err)
+	}
+
+	// 注册 RTP 头扩展（关键修复）。
+	//
+	// 背景：日志中反复出现
+	//   Incoming unhandled RTP ssrc(...), OnTrack will not be fired.
+	//   mid RTP Extensions required for Simulcast
+	// 根因是服务端媒体引擎没有注册 mid / rid 头扩展：
+	//   - mid（SDESMidURI）：标识每个 m= 段，是多路媒体「归属哪条轨道」的唯一依据；
+	//   - rid（SDESRTPStreamIDURI）：Simulcast 中每一路编码流的标识。
+	// 浏览器可能为同一条视频轨道携带多路编码（多个 SSRC），
+	// 服务端若缺少 mid/rid 扩展，就无法把这些 SSRC 关联到 OnTrack 出来的轨道，
+	// 于是大量 RTP 包被判为 "unhandled ssrc" 直接丢弃，表现为连接正常却没有画面。
+	// 显式注册后 pion 即可正确完成 SSRC ↔ Track 关联。
+	//
+	// 注意：RegisterHeaderExtension 的签名是
+	//   (能力, 编解码类型, 允许方向...)
+	// 其中「允许方向」只接受 recvonly / sendonly（不传即默认为两者皆可，等价双向），
+	// 不能传 sendrecv。因此这里不传方向，并对 video / audio 各注册一次；
+	// rid 仅用于视频，只注册到 video。
+	if err := mediaEngine.RegisterHeaderExtension(
+		webrtc.RTPHeaderExtensionCapability{URI: sdp.SDESMidURI},
+		webrtc.RTPCodecTypeVideo,
+	); err != nil {
+		return nil, fmt.Errorf("注册 mid 头扩展(video)失败: %w", err)
+	}
+	if err := mediaEngine.RegisterHeaderExtension(
+		webrtc.RTPHeaderExtensionCapability{URI: sdp.SDESMidURI},
+		webrtc.RTPCodecTypeAudio,
+	); err != nil {
+		return nil, fmt.Errorf("注册 mid 头扩展(audio)失败: %w", err)
+	}
+	if err := mediaEngine.RegisterHeaderExtension(
+		webrtc.RTPHeaderExtensionCapability{URI: sdp.SDESRTPStreamIDURI},
+		webrtc.RTPCodecTypeVideo,
+	); err != nil {
+		return nil, fmt.Errorf("注册 rid 头扩展(video)失败: %w", err)
 	}
 
 	// 创建拦截器链：注册 pion 默认拦截器（NACK 重传、RTCP 反馈、TWCC 拥塞控制）
@@ -133,6 +188,23 @@ func initWebRTC(pubIP string) (*webrtc.API, error) {
 	return api, nil
 }
 
+// isPrivateIP 判断是否为「不应对外下发的」内网类 IP。
+//
+// 用于 --filter-private-ice 时的 ICE 候选过滤，涵盖：
+//   - 私有地址：10.0.0.0/8、172.16.0.0/12、192.168.0.0/16、fc00::/7；
+//   - 回环地址：127.0.0.0/8、::1；
+//   - 链路本地地址：169.254.0.0/16、fe80::/10（含单播与组播）；
+//   - 未指定地址：0.0.0.0、::。
+//
+// 返回 true 表示该地址属于内网、可被过滤掉。
+func isPrivateIP(ip net.IP) bool {
+	if ip == nil {
+		return false
+	}
+	return ip.IsPrivate() || ip.IsLoopback() || ip.IsLinkLocalUnicast() ||
+		ip.IsLinkLocalMulticast() || ip.IsUnspecified()
+}
+
 // ============================================================
 // 内嵌 TURN 服务端
 // ============================================================
@@ -140,6 +212,59 @@ func initWebRTC(pubIP string) (*webrtc.API, error) {
 // turnConfigPlaceholder 是 index.html 中的占位符，
 // 页面渲染时会被替换成内嵌 TURN 的 JSON 配置（未启用时为 null）。
 const turnConfigPlaceholder = "__YSP_TURN_CONFIG_PLACEHOLDER__"
+
+// turnCredFile 内嵌 TURN 凭据的持久化文件名：
+// 让 TURN 用户名/密码在服务重启后保持不变。
+const turnCredFile = "turn_credential.json"
+
+// turnCredential 持久化的 TURN 凭据
+type turnCredential struct {
+	User string `json:"user"`
+	Pass string `json:"pass"`
+}
+
+// loadOrCreateTURNCredential 解析内嵌 TURN 的用户名与密码。
+//
+// 规则（优先级从高到低）：
+//  1. --turn-pass 显式填写：直接使用，不落盘；
+//  2. 本地已有 turn_credential.json：复用其中凭据（重启后密码不变）；
+//  3. 两者都没有：生成 24 位十六进制随机密码并写入文件。
+//
+// 关键修复点：过去密码留空即「每次启动随机生成」，浏览器（尤其手机 WebView）
+// 若缓存了旧页面，页面里注入的还是旧密码，向新进程申请中继时必然
+// "integrity check failed"，TURN 永远建立不起来。持久化后即使服务重启，
+// 旧缓存的页面也能继续通过认证。
+func loadOrCreateTURNCredential(user, pass string) (string, string, error) {
+	if pass != "" {
+		return user, pass, nil
+	}
+
+	// 优先复用持久化凭据
+	if data, err := os.ReadFile(turnCredFile); err == nil {
+		var c turnCredential
+		if json.Unmarshal(data, &c) == nil && c.User != "" && c.Pass != "" {
+			log.Infof("内嵌 TURN: 复用持久化凭据文件 %s（user=%s）", turnCredFile, c.User)
+			return c.User, c.Pass, nil
+		}
+		log.Warnf("内嵌 TURN: 凭据文件 %s 内容无效，将重新生成", turnCredFile)
+	}
+
+	// 生成新密码并持久化
+	buf := make([]byte, 12)
+	if _, err := rand.Read(buf); err != nil {
+		return "", "", fmt.Errorf("生成内嵌 TURN 随机密码失败: %w", err)
+	}
+	newPass := hex.EncodeToString(buf)
+	c := turnCredential{User: user, Pass: newPass}
+	if data, err := json.MarshalIndent(c, "", "  "); err == nil {
+		if werr := os.WriteFile(turnCredFile, data, 0600); werr != nil {
+			log.Warnf("内嵌 TURN: 写入凭据文件失败（重启后密码会变化）: %v", werr)
+		} else {
+			log.Infof("内嵌 TURN: 已生成并持久化凭据到 %s（重启后密码保持稳定）", turnCredFile)
+		}
+	}
+	return user, newPass, nil
+}
 
 // startEmbeddedTURN 在本进程内启动一个 TURN 中继服务。
 //
@@ -171,15 +296,12 @@ func startEmbeddedTURN(pubIP string) error {
 		return fmt.Errorf("--public-ip 不是合法 IP 地址: %s", pubIP)
 	}
 
-	// 密码留空则随机生成 24 位十六进制串，避免使用弱口令
-	user := *turnUser
-	pass := *turnPass
-	if pass == "" {
-		buf := make([]byte, 12)
-		if _, err := rand.Read(buf); err != nil {
-			return fmt.Errorf("生成内嵌 TURN 随机密码失败: %w", err)
-		}
-		pass = hex.EncodeToString(buf)
+	// 解析 TURN 凭据：
+	// 若 --turn-pass 未显式填写，则从本地凭据文件读取；文件不存在时
+	// 生成随机密码并持久化，保证「服务重启后密码不变」（见函数注释）。
+	user, pass, err := loadOrCreateTURNCredential(*turnUser, *turnPass)
+	if err != nil {
+		return err
 	}
 
 	realm := *turnRealm
@@ -269,7 +391,16 @@ func handleIndex(w http.ResponseWriter, r *http.Request) {
 	page := strings.Replace(string(data), turnConfigPlaceholder, embeddedTURNJSON(), 1)
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	w.Header().Set("Cache-Control", "no-cache")
+
+	// 关键修复：强制浏览器/手机 WebView 每次重新拉取页面，禁止任何缓存副本。
+	// 原因：后端早已支持 sessions_list（新加入者能看到房间内既有成员），
+	// 但部分浏览器一旦缓存了旧版 index.html（旧版没有处理 sessions_list 的逻辑），
+	// 就会出现「第二个接入房间的用户看不到第一个用户的列表和通话按钮」的现象。
+	// 仅用 no-cache 不足以让个别 WebView 放弃缓存，这里补全 no-store / must-revalidate
+	// 以及 HTTP/1.0 时代的 Pragma / Expires，做到全平台彻底不缓存。
+	w.Header().Set("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
+	w.Header().Set("Pragma", "no-cache")
+	w.Header().Set("Expires", "0")
 	_, _ = w.Write([]byte(page))
 }
 
