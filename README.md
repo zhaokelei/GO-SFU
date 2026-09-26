@@ -239,6 +239,45 @@ server {
 sudo nginx -t && sudo nginx -s reload
 ```
 
+### 2.1 宝塔面板（BT Panel）配置
+
+宝塔添加站点时会自动生成站点主配置（`listen` / `server_name` / `root` / SSL / HTTP 跳转等），
+**不要整体替换**。只需在站点「配置文件」里，把下面这一段粘进 `server { }` 内部任意位置
+（例如 `#SSL-INFO-END` 之后），保存并在面板点「重载配置」即可：
+
+```nginx
+    # ==== YSP SFU 后端反代：页面 + 信令 WebSocket ====
+    location / {
+        proxy_pass http://127.0.0.1:2033;
+        proxy_http_version 1.1;
+
+        proxy_set_header Host              $host;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        # WebSocket 升级必需：缺这两行 /ws 握手会失败（后端报 upgrade token not found）
+        proxy_set_header Upgrade    $http_upgrade;
+        proxy_set_header Connection "upgrade";
+
+        # 信令是长连接，超时必须放大，否则会频繁掉线重连
+        proxy_read_timeout    3600s;
+        proxy_send_timeout    3600s;
+        proxy_connect_timeout 10s;
+
+        # 关闭响应缓冲，降低信令延迟
+        proxy_buffering off;
+    }
+```
+
+> **说明**：
+> 1. 前端页面已内嵌在 `sfu.exe` 中，所以用 `location /` 一条即可把**页面和 `/ws` 信令**一起转给后端，
+>    不必再把文件放进 `wwwroot`；
+> 2. 若你只想反代信令、页面另放宝塔静态目录，把 `location /` 改成 `location /ws`；
+> 3. 宝塔自带的 `#PHP-INFO` / `#REWRITE` / `#redirect` / `#static-cache` 等 `include` 保留面板默认内容即可；
+> 4. 若面板的 `static_cache` 里对 `\.(js|css|png|jpg...)` 定义了带 `expires` 的 `location`，
+>    它会优先于 `location /` 而拦截这些请求，必要时把该 `include` 注释掉。
+
 ### 3. 启动后端
 
 Nginx 已做 TLS 终止，后端继续用 HTTP 启动即可：
